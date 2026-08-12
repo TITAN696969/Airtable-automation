@@ -1,15 +1,25 @@
 const Airtable = require('airtable');
 const fetch = require('node-fetch');
+const http = require('http');
 
 // ====================== CONFIG ======================
-const AIRTABLE_API_KEY = process.env.AIRTABLE_API_KEY;     // your pat... key
-const GEMINI_API_KEY   = process.env.GEMINI_API_KEY;       // your AQ... key
+const AIRTABLE_API_KEY = process.env.AIRTABLE_API_KEY;
+const GEMINI_API_KEY   = process.env.GEMINI_API_KEY;
 const BASE_ID          = "app7381NQaLvJhj2Y";
-const TABLE_ID         = "tblZLPqHrhyAIGHW9";               // Carousel Batches
-const MODEL            = "gemini-3-pro-image";              // Nano Banana Pro
+const TABLE_ID         = "tblZLPqHrhyAIGHW9";
+const MODEL            = "gemini-3-pro-image";
 // ====================================================
 
 const base = new Airtable({ apiKey: AIRTABLE_API_KEY }).base(BASE_ID);
+
+// Tiny server so Render is happy (free web service)
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Carousel generator is running');
+}).listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
 
 async function getBase64(url) {
   const res = await fetch(url);
@@ -20,7 +30,6 @@ async function getBase64(url) {
 async function generateImage(modelRefs, prompt, slideNumber) {
   const parts = [];
 
-  // Use first 2 model reference images max
   for (let att of modelRefs.slice(0, 2)) {
     parts.push({
       inline_data: {
@@ -41,17 +50,14 @@ async function generateImage(modelRefs, prompt, slideNumber) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         contents: [{ parts }],
-        generationConfig: {
-          responseModalities: ["IMAGE"]
-        }
+        generationConfig: { responseModalities: ["IMAGE"] }
       })
     }
   );
 
   const data = await response.json();
-
   if (!response.ok) {
-    console.error("Gemini error:", JSON.stringify(data));
+    console.error(JSON.stringify(data));
     throw new Error("Gemini API failed");
   }
 
@@ -63,9 +69,7 @@ async function generateImage(modelRefs, prompt, slideNumber) {
     }
   }
 
-  if (!imagePart) {
-    throw new Error("No image returned from Gemini");
-  }
+  if (!imagePart) throw new Error("No image returned");
 
   const b64 = imagePart.inlineData?.data || imagePart.inline_data?.data;
   const mime = imagePart.inlineData?.mimeType || imagePart.inline_data?.mime_type || "image/png";
@@ -78,68 +82,51 @@ async function generateImage(modelRefs, prompt, slideNumber) {
 
 async function processRecord(record) {
   const recordId = record.id;
-  console.log(`Processing record ${recordId}`);
+  console.log(`Processing ${recordId}`);
 
-  // Set status to Generating
   await base(TABLE_ID).update(recordId, { "Status": "Generating" });
 
   const modelLinked = record.get("Model");
-  if (!modelLinked || modelLinked.length === 0) {
-    throw new Error("No Model selected");
-  }
+  if (!modelLinked || modelLinked.length === 0) throw new Error("No Model");
 
-  // Get Model record
   const modelRecord = await base("Models").find(modelLinked[0]);
   const modelRefs = modelRecord.get("Reference image") || [];
   const prompt = record.get("Prompt") || "";
 
-  // Generate 5 images one by one
   for (let i = 1; i <= 5; i++) {
-    console.log(`→ Generating slide ${i}/5 for ${recordId}`);
-
+    console.log(`Generating slide ${i}/5`);
     const image = await generateImage(modelRefs, prompt, i);
-
-    const update = {};
-    update[`Output ${i}`] = [image];
-
-    await base(TABLE_ID).update(recordId, update);
-    console.log(`✓ Slide ${i} saved`);
+    await base(TABLE_ID).update(recordId, { [`Output ${i}`]: [image] });
+    console.log(`Slide ${i} saved`);
   }
 
-  // Finished
   await base(TABLE_ID).update(recordId, {
     "Status": "In Review",
     "Slide": null
   });
 
-  console.log(`✅ Record ${recordId} completed`);
+  console.log(`✅ Finished ${recordId}`);
 }
 
 async function checkForJobs() {
   try {
     const records = await base(TABLE_ID)
-      .select({
-        filterByFormula: `{Status} = "Generate"`,
-        maxRecords: 3
-      })
+      .select({ filterByFormula: `{Status} = "Generate"`, maxRecords: 2 })
       .firstPage();
 
     for (const record of records) {
       try {
         await processRecord(record);
       } catch (err) {
-        console.error("Error processing record:", err.message);
-        await base(TABLE_ID).update(record.id, {
-          "Status": "Failed"
-        });
+        console.error(err.message);
+        await base(TABLE_ID).update(record.id, { "Status": "Failed" });
       }
     }
   } catch (err) {
-    console.error("Error checking jobs:", err.message);
+    console.error("Check error:", err.message);
   }
 }
 
-// Start polling every 25 seconds
-console.log("🚀 Carousel generator started...");
+console.log("🚀 Carousel generator started");
 setInterval(checkForJobs, 25000);
-checkForJobs(); // run once immediately
+checkForJobs();

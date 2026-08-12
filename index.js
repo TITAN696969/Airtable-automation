@@ -26,10 +26,49 @@ http.createServer((req, res) => {
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
+function norm(s) {
+  return String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function attachmentsIn(record, wanted) {
+  const want = norm(wanted);
+  for (const name of Object.keys(record.fields || {})) {
+    if (norm(name) !== want) continue;
+    const v = record.fields[name];
+    if (Array.isArray(v) && v.length && v[0] && v[0].url) return { name, files: v };
+  }
+  return null;
+}
+
+function firstAttachmentField(record, names) {
+  for (const n of names) {
+    const hit = attachmentsIn(record, n);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+async function setField(id, fields) {
+  try {
+    await jobs.update(id, fields);
+    return true;
+  } catch (e) {
+    log("update failed", JSON.stringify(fields), e.message);
+    return false;
+  }
+}
+
+async function note(id, text) {
+  log("NOTE", text);
+  await setField(id, { Notes: String(text).slice(0, 900) });
+}
+
 async function getBuf(url) {
-  const r = await fetch(url, { timeout: 30000 });
+  const r = await fetch(url, { timeout: 45000 });
   if (!r.ok) throw new Error("download " + r.status);
-  return r.buffer();
+  const buf = await r.buffer();
+  if (!buf || !buf.length) throw new Error("empty download");
+  return buf;
 }
 
 async function upload(recordId, field, b64, filename) {
@@ -41,12 +80,8 @@ async function upload(recordId, field, b64, filename) {
     body: JSON.stringify({ contentType: "image/jpeg", file: b64, filename })
   });
   const txt = await r.text();
-  if (!r.ok) throw new Error("upload " + field + " " + r.status + " " + txt.slice(0, 200));
+  if (!r.ok) throw new Error("upload " + field + " " + r.status + " " + txt.slice(0, 180));
   log("  uploaded", field, filename);
-}
-
-async function clear(recordId, field) {
-  try { await jobs.update(recordId, { [field]: [] }); } catch (e) { log("clear", field, e.message); }
 }
 
 async function styleOne(buffer, look) {
@@ -59,34 +94,55 @@ async function styleOne(buffer, look) {
   if (look.linear) img = img.linear(look.linear[0], look.linear[1]);
   if (look.gamma) img = img.gamma(look.gamma);
   if (look.sharpen) img = img.sharpen(look.sharpen);
-  return img.jpeg({ quality: 90, mozjpeg: true }).toBuffer();
+  return img.jpeg({ quality: 88, mozjpeg: true }).toBuffer();
 }
 
 async function styleRecord(record) {
   const id = record.id;
-  log("START style", id);
-  await jobs.update(id, { Status: "Generating" });
+  log("START", id, "fields=", Object.keys(record.fields || {}));
 
-  const src = record.get("Output 1") || [];
-  if (!src.length) throw new Error("Output 1 is empty");
-  log("source photos", src.length);
-
-  const bufs = [];
-  for (const att of src) {
-    const b = await getBuf(att.url);
-    bufs.push(b);
-    log("  loaded", att.filename || "img", b.length);
+  const fresh = await jobs.find(id);
+  log("refetch fields=", Object.keys(fresh.fields || {}));
+  for (const [k, v] of Object.entries(fresh.fields || {})) {
+    if (Array.isArray(v) && v[0] && v[0].url) log("  att", k, v.length);
   }
 
+  await setField(id, { Status: "Generating" });
+
+  const src =
+    firstAttachmentField(fresh, ["Output 1", "Output1", "output 1"]) ||
+    firstAttachmentField(fresh, ["Input References", "InputReferences", "Reference image"]);
+
+  if (!src) {
+    throw new Error("No photos found. Put images in Output 1 then set Generate again. Fields: " + Object.keys(fresh.fields || {}).join(", "));
+  }
+
+  log("using", src.name, "count", src.files.length);
+  await note(id, "Styling " + src.files.length + " photo(s) from " + src.name);
+
+  const bufs = [];
+  for (const att of src.files) {
+    try {
+      const b = await getBuf(att.url);
+      bufs.push(b);
+      log("  loaded", att.filename || "img", b.length);
+    } catch (e) {
+      log("  skip load", e.message);
+    }
+  }
+  if (!bufs.length) throw new Error("Could not download any source photos");
+
+  let saved = 0;
   for (const n of [2, 3, 4, 5]) {
     const look = LOOKS[n];
     const field = "Output " + n;
     log("look", n, look.name);
-    await clear(id, field);
+    await setField(id, { [field]: [] });
     for (let i = 0; i < bufs.length; i++) {
       try {
         const out = await styleOne(bufs[i], look);
         await upload(id, field, out.toString("base64"), "output_" + n + "_" + look.name + "_" + (i + 1) + ".jpg");
+        saved += 1;
       } catch (e) {
         log("skip", field, i + 1, e.message);
       }
@@ -94,8 +150,10 @@ async function styleRecord(record) {
     log("ok", field);
   }
 
-  await jobs.update(id, { Status: "In Review" });
-  log("DONE", id);
+  if (!saved) throw new Error("Styled 0 images — upload failed");
+  await setField(id, { Status: "In Review" });
+  await note(id, "Done. Styled " + saved + " images into Output 2-5.");
+  log("DONE", id, "saved", saved);
 }
 
 async function poll() {
@@ -104,26 +162,33 @@ async function poll() {
   try {
     const found = await jobs.select({
       filterByFormula: 'OR({Status}="Generate",{Status}="Style")',
-      maxRecords: 1
+      maxRecords: 3
     }).firstPage();
+
     if (!found.length) {
-      const peek = await jobs.select({ maxRecords: 5 }).firstPage();
-      log("idle", peek.map((r) => r.get("Status")).join(","));
+      const peek = await jobs.select({ maxRecords: 8 }).firstPage();
+      log("idle", peek.map((r) => r.id.slice(-6) + "=" + r.get("Status")).join(" | "));
       return;
     }
-    try {
-      await styleRecord(found[0]);
-    } catch (e) {
-      log("FAIL", found[0].id, e.message);
-      try { await jobs.update(found[0].id, { Status: "Failed" }); } catch (x) {}
+
+    for (const rec of found) {
+      try {
+        await styleRecord(rec);
+      } catch (e) {
+        log("FAIL", rec.id, e.message);
+        if (e.stack) log(e.stack);
+        await note(rec.id, "FAILED: " + e.message);
+        await setField(rec.id, { Status: "Failed" });
+      }
     }
   } catch (e) {
     log("poll", e.message);
+    if (e.stack) log(e.stack);
   } finally {
     busy = false;
   }
 }
 
-log("styler start", BASE_ID, TABLE_ID, { at: !!AIRTABLE_API_KEY });
+log("styler start", { base: BASE_ID, table: TABLE_ID, key: !!AIRTABLE_API_KEY });
 setInterval(poll, POLL_MS);
 poll();

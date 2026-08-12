@@ -14,9 +14,9 @@ const PORT = process.env.PORT || 3000;
 
 const LOOKS = {
   2: { name: "warm-sun", modulate: { brightness: 1.03, saturation: 1.07, hue: 5 }, linear: [1.05, 2], gamma: 1.02 },
-  3: { name: "cool-clean", modulate: { brightness: 1.02, saturation: 0.93, hue: -7 }, linear: [1.06, 0], gamma: 0.98 },
+  3: { name: "cool-clean", modulate: { brightness: 1.02, saturation: 0.93, hue: -7 }, linear: [1.06, 0] },
   4: { name: "soft-matte", modulate: { brightness: 1.03, saturation: 0.94, hue: 2 }, linear: [0.86, 16], gamma: 1.05 },
-  5: { name: "crisp-editorial", modulate: { brightness: 1.02, saturation: 1.05, hue: -1 }, linear: [1.1, -3], gamma: 0.97, sharpen: { sigma: 0.7 } }
+  5: { name: "crisp-editorial", modulate: { brightness: 1.02, saturation: 1.05, hue: -1 }, linear: [1.1, -3], sharpen: { sigma: 0.7 } }
 };
 
 const root = new Airtable({ apiKey: AIRTABLE_API_KEY }).base(BASE_ID);

@@ -1,16 +1,3 @@
-/**
- * Carousel generator worker
- *
- * Status = Generate
- *   1) AI: each Input Reference → Output 1 (Gemini, one by one)
- *   2) No AI: copy Output 1 into Output 2–5 with a different light/filter
- *
- * Status = Style
- *   skip AI, restyle existing Output 1 into Output 2–5
- *
- * Turn OFF the native Airtable automation or it will steal the job.
- */
-
 const Airtable = require("airtable");
 const fetch = require("node-fetch");
 const http = require("http");
@@ -26,314 +13,221 @@ const POLL_MS = Number(process.env.POLL_MS || 15000);
 const PORT = process.env.PORT || 3000;
 
 const LOOKS = {
-  2: {
-    name: "warm-sun",
-    modulate: { brightness: 1.03, saturation: 1.07, hue: 5 },
-    linear: [1.05, 2],
-    gamma: 1.02,
-  },
-  3: {
-    name: "cool-clean",
-    modulate: { brightness: 1.02, saturation: 0.93, hue: -7 },
-    linear: [1.06, 0],
-    gamma: 0.98,
-  },
-  4: {
-    name: "soft-matte",
-    modulate: { brightness: 1.03, saturation: 0.94, hue: 2 },
-    linear: [0.86, 16],
-    gamma: 1.05,
-  },
-  5: {
-    name: "crisp-editorial",
-    modulate: { brightness: 1.02, saturation: 1.05, hue: -1 },
-    linear: [1.10, -3],
-    gamma: 0.97,
-    sharpen: { sigma: 0.7 },
-  },
+  2: { name: "warm-sun", modulate: { brightness: 1.03, saturation: 1.07, hue: 5 }, linear: [1.05, 2], gamma: 1.02 },
+  3: { name: "cool-clean", modulate: { brightness: 1.02, saturation: 0.93, hue: -7 }, linear: [1.06, 0], gamma: 0.98 },
+  4: { name: "soft-matte", modulate: { brightness: 1.03, saturation: 0.94, hue: 2 }, linear: [0.86, 16], gamma: 1.05 },
+  5: { name: "crisp-editorial", modulate: { brightness: 1.02, saturation: 1.05, hue: -1 }, linear: [1.1, -3], gamma: 0.97, sharpen: { sigma: 0.7 } }
 };
 
-if (!AIRTABLE_API_KEY) console.error("MISSING AIRTABLE_API_KEY");
-if (!GEMINI_API_KEY) console.error("MISSING GEMINI_API_KEY");
-
-const airtable = new Airtable({ apiKey: AIRTABLE_API_KEY }).base(BASE_ID);
-const jobsTable = airtable(TABLE_ID);
-const modelsTable = airtable(MODELS_TABLE);
-
+const base = new Airtable({ apiKey: AIRTABLE_API_KEY }).base(BASE_ID);
+const jobs = base(TABLE_ID);
+const models = base(MODELS_TABLE);
 let busy = false;
 
-http
-  .createServer((req, res) => {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("carousel generator running\n");
-  })
-  .listen(PORT, () => console.log("http listening on", PORT));
+http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("ok\n");
+}).listen(PORT, () => console.log("http", PORT));
 
-function log(...args) {
-  console.log(new Date().toISOString(), ...args);
+const log = (...a) => console.log(new Date().toISOString(), ...a);
+
+async function getBuf(url) {
+  const r = await fetch(url, { timeout: 30000 });
+  if (!r.ok) throw new Error("download " + r.status);
+  return r.buffer();
 }
 
-async function downloadBuffer(url) {
-  const res = await fetch(url, { timeout: 30000 });
-  if (!res.ok) throw new Error("download failed " + res.status);
-  return res.buffer();
-}
-
-async function downloadBase64(url) {
-  const buf = await downloadBuffer(url);
-  return { data: buf.toString("base64"), bytes: buf.length };
-}
-
-function imagePart(mime, data) {
-  return { inline_data: { mime_type: mime || "image/jpeg", data } };
+async function smallJpeg(url, max) {
+  const raw = await getBuf(url);
+  const out = await sharp(raw, { failOn: "none" })
+    .rotate()
+    .resize({ width: max, height: max, fit: "inside", withoutEnlargement: true })
+    .jpeg({ quality: 82, mozjpeg: true })
+    .toBuffer();
+  log("  resized", raw.length, "->", out.length);
+  return out;
 }
 
 function extractImage(data) {
-  const parts = data?.candidates?.[0]?.content?.parts || [];
-  for (const p of parts) {
-    const inline = p.inlineData || p.inline_data;
-    if (inline && inline.data) {
-      return {
-        data: inline.data,
-        mime: inline.mimeType || inline.mime_type || "image/png",
-      };
-    }
+  for (const p of data?.candidates?.[0]?.content?.parts || []) {
+    const x = p.inlineData || p.inline_data;
+    if (x && x.data) return { data: x.data, mime: x.mimeType || x.mime_type || "image/png" };
   }
   return null;
 }
 
-async function generateFromRefs(modelRefs, sceneRef, prompt, index, total) {
-  const parts = [];
-
-  for (const att of modelRefs.slice(0, 2)) {
-    const { data, bytes } = await downloadBase64(att.url);
-    log("  model ref", att.filename || "unnamed", bytes, "bytes");
-    parts.push(imagePart(att.type, data));
-  }
-
-  if (sceneRef) {
-    const { data, bytes } = await downloadBase64(sceneRef.url);
-    log("  scene ref", sceneRef.filename || "unnamed", bytes, "bytes");
-    parts.push(imagePart(sceneRef.type, data));
-  }
-
-  parts.push({
-    text: [
-      "You are an expert image editor.",
-      "Recreate the scene / pose from the last reference photo.",
-      "The person must look like the person in the first reference photos (same face, hair, skin).",
-      "Photorealistic. High quality.",
-      `This is image ${index} of ${total}.`,
-      prompt || "",
-    ].join(" "),
-  });
-
-  log("  calling Gemini", MODEL);
-  const started = Date.now();
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+async function postGemini(parts) {
+  const r = await fetch(
+    "https://generativelanguage.googleapis.com/v1beta/models/" + MODEL + ":generateContent?key=" + GEMINI_API_KEY,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      timeout: 120000,
+      timeout: 90000,
       body: JSON.stringify({
         contents: [{ parts }],
-        generationConfig: { responseModalities: ["IMAGE"] },
-      }),
+        generationConfig: { responseModalities: ["IMAGE"] }
+      })
     }
   );
-
-  const json = await res.json();
-  log("  Gemini", res.status, ((Date.now() - started) / 1000).toFixed(1) + "s");
-
-  if (!res.ok) {
-    throw new Error("Gemini " + res.status + " " + JSON.stringify(json).slice(0, 400));
-  }
-
-  const image = extractImage(json);
-  if (!image) {
-    throw new Error("Gemini returned no image: " + JSON.stringify(json).slice(0, 600));
-  }
-  return image;
+  const json = await r.json();
+  return { ok: r.ok, status: r.status, json };
 }
 
-async function uploadAttachment(recordId, fieldName, base64, filename, contentType) {
-  const url =
-    `https://content.airtable.com/v0/${BASE_ID}/${recordId}/` +
-    `${encodeURIComponent(fieldName)}/uploadAttachment`;
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: "Bearer " + AIRTABLE_API_KEY,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      contentType: contentType || "image/jpeg",
-      file: base64,
-      filename: filename || "output.jpg",
-    }),
-    timeout: 60000,
+async function gemini(modelRefs, scene, prompt, i, total) {
+  const parts = [];
+  for (const att of modelRefs.slice(0, 2)) {
+    const buf = await smallJpeg(att.url, 768);
+    parts.push({ inline_data: { mime_type: "image/jpeg", data: buf.toString("base64") } });
+  }
+  if (scene) {
+    const buf = await smallJpeg(scene.url, 1024);
+    parts.push({ inline_data: { mime_type: "image/jpeg", data: buf.toString("base64") } });
+  }
+  parts.push({
+    text: "You are an expert image editor. Recreate the scene from the last reference photo. The person must match the first reference photos. Photorealistic. Image " + i + " of " + total + ". " + (prompt || "")
   });
 
-  const text = await res.text();
-  if (!res.ok) throw new Error("upload " + fieldName + " " + res.status + " " + text.slice(0, 300));
-  log("  uploaded", fieldName, filename);
-}
-
-async function clearField(recordId, fieldName) {
-  try {
-    await jobsTable.update(recordId, { [fieldName]: [] });
-  } catch (e) {
-    log("clear", fieldName, e.message);
+  let last = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    log("  Gemini try", attempt);
+    const t = Date.now();
+    try {
+      const res = await postGemini(parts);
+      log("  Gemini", res.status, ((Date.now() - t) / 1000).toFixed(1) + "s");
+      if (!res.ok) {
+        last = new Error("Gemini " + res.status + " " + JSON.stringify(res.json).slice(0, 300));
+        continue;
+      }
+      const img = extractImage(res.json);
+      if (!img) {
+        last = new Error("no image " + JSON.stringify(res.json).slice(0, 400));
+        continue;
+      }
+      return img;
+    } catch (e) {
+      last = e;
+      log("  Gemini error", e.message);
+    }
   }
+  throw last || new Error("Gemini failed");
 }
 
-async function applyLook(buffer, look) {
+async function upload(recordId, field, b64, filename, type) {
+  const url = "https://content.airtable.com/v0/" + BASE_ID + "/" + recordId + "/" + encodeURIComponent(field) + "/uploadAttachment";
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: "Bearer " + AIRTABLE_API_KEY, "Content-Type": "application/json" },
+    timeout: 60000,
+    body: JSON.stringify({ contentType: type || "image/jpeg", file: b64, filename: filename || "out.jpg" })
+  });
+  const txt = await r.text();
+  if (!r.ok) throw new Error("upload " + field + " " + r.status + " " + txt.slice(0, 250));
+  log("  uploaded", field, filename);
+}
+
+async function clear(recordId, field) {
+  try { await jobs.update(recordId, { [field]: [] }); } catch (e) { log("clear", field, e.message); }
+}
+
+async function styleBuf(buffer, look) {
   let img = sharp(buffer, { failOn: "none" }).rotate();
   const meta = await img.metadata();
-  const longest = Math.max(meta.width || 0, meta.height || 0);
-  if (longest > 2048) img = img.resize({ width: 2048, height: 2048, fit: "inside" });
-
+  if (Math.max(meta.width || 0, meta.height || 0) > 2048) {
+    img = img.resize({ width: 2048, height: 2048, fit: "inside" });
+  }
   if (look.modulate) img = img.modulate(look.modulate);
   if (look.linear) img = img.linear(look.linear[0], look.linear[1]);
   if (look.gamma) img = img.gamma(look.gamma);
   if (look.sharpen) img = img.sharpen(look.sharpen);
-
   return img.jpeg({ quality: 90, mozjpeg: true }).toBuffer();
 }
 
 async function styleOutputs(recordId) {
-  const fresh = await jobsTable.find(recordId);
-  const originals = fresh.get("Output 1") || [];
-  if (!originals.length) throw new Error("Output 1 is empty — nothing to style");
-
-  log("styling", originals.length, "photo(s) into Output 2–5");
-
-  const buffers = [];
-  for (const att of originals) {
-    const buf = await downloadBuffer(att.url);
-    buffers.push(buf);
-    log("  loaded", att.filename || "Output 1 image", buf.length, "bytes");
-  }
-
+  const rec = await jobs.find(recordId);
+  const src = rec.get("Output 1") || [];
+  if (!src.length) throw new Error("Output 1 empty");
+  log("styling", src.length, "into 2-5");
+  const bufs = [];
+  for (const att of src) bufs.push(await getBuf(att.url));
   for (const n of [2, 3, 4, 5]) {
     const look = LOOKS[n];
     const field = "Output " + n;
-    await clearField(recordId, field);
-
-    for (let i = 0; i < buffers.length; i++) {
-      const styled = await applyLook(buffers[i], look);
-      await uploadAttachment(
-        recordId,
-        field,
-        styled.toString("base64"),
-        `output_${n}_${look.name}_${i + 1}.jpg`,
-        "image/jpeg"
-      );
+    await clear(recordId, field);
+    for (let i = 0; i < bufs.length; i++) {
+      const out = await styleBuf(bufs[i], look);
+      await upload(recordId, field, out.toString("base64"), "output_" + n + "_" + look.name + "_" + (i + 1) + ".jpg", "image/jpeg");
     }
-    log("✓", field, look.name);
+    log("ok", field, look.name);
   }
 }
 
 async function generateOutput1(record) {
   const id = record.id;
-  const modelLinked = record.get("Model") || [];
-  if (!modelLinked.length) throw new Error("No Model selected");
-
-  const modelRecord = await modelsTable.find(modelLinked[0]);
-  const modelRefs = modelRecord.get("Reference image") || [];
-  const inputRefs = record.get("Input References") || [];
+  const linked = record.get("Model") || [];
+  if (!linked.length) throw new Error("No Model");
+  const modelRec = await models.find(linked[0]);
+  const modelRefs = modelRec.get("Reference image") || [];
+  const inputs = record.get("Input References") || [];
   const prompt = record.get("Prompt") || "";
-
-  log("model", modelRecord.get("Name") || modelLinked[0]);
-  log("model refs", modelRefs.length, "input refs", inputRefs.length);
-
-  if (!modelRefs.length && !inputRefs.length) {
-    throw new Error("No reference images on Model or Input References");
-  }
-
-  await clearField(id, "Output 1");
-
-  const queue = inputRefs.length ? inputRefs : [null];
-  const total = queue.length;
-
+  log("model", modelRec.get("Name") || linked[0], "refs", modelRefs.length, "inputs", inputs.length);
+  if (!modelRefs.length && !inputs.length) throw new Error("no refs");
+  await clear(id, "Output 1");
+  const queue = inputs.length ? inputs : [null];
+  let ok = 0;
+  let lastErr = null;
   for (let i = 0; i < queue.length; i++) {
-    log(`--- AI reference ${i + 1}/${total} ---`);
-    const image = await generateFromRefs(modelRefs, queue[i], prompt, i + 1, total);
-    await uploadAttachment(id, "Output 1", image.data, `output_1_${i + 1}.png`, image.mime);
-    log(`✓ Output 1 image ${i + 1}/${total}`);
+    log("AI", i + 1, "/", queue.length);
+    try {
+      const img = await gemini(modelRefs, queue[i], prompt, i + 1, queue.length);
+      await upload(id, "Output 1", img.data, "output_1_" + (i + 1) + ".png", img.mime);
+      ok += 1;
+    } catch (e) {
+      lastErr = e;
+      log("skip image", i + 1, e.message);
+    }
   }
+  if (!ok) throw lastErr || new Error("all AI images failed");
+  log("AI done", ok, "/", queue.length);
 }
 
-async function bumpFailed(record) {
-  const current = Number(record.get("Failed generations") || 0);
-  try {
-    await jobsTable.update(record.id, {
-      Status: "Failed",
-      "Failed generations": current + 1,
-    });
-  } catch (e) {
-    log("could not mark Failed", e.message);
-  }
+async function fail(record, err) {
+  log("FAIL", record.id, err && err.message);
+  if (err && err.stack) log(err.stack);
+  const n = Number(record.get("Failed generations") || 0);
+  try { await jobs.update(record.id, { Status: "Failed", "Failed generations": n + 1 }); } catch (e) {}
 }
 
-async function processRecord(record, mode) {
-  const id = record.id;
-  log("===== START", id, "mode=" + mode, "=====");
-  await jobsTable.update(id, { Status: "Generating" });
-
-  if (mode === "Generate") {
-    await generateOutput1(record);
-  }
-
-  await styleOutputs(id);
-
-  await jobsTable.update(id, { Status: "In Review" });
-  log("===== DONE", id, "=====");
+async function run(record, mode) {
+  log("START", record.id, mode);
+  await jobs.update(record.id, { Status: "Generating" });
+  if (mode === "Generate") await generateOutput1(record);
+  await styleOutputs(record.id);
+  await jobs.update(record.id, { Status: "In Review" });
+  log("DONE", record.id);
 }
 
-async function checkForJobs() {
-  if (busy) {
-    log("still working, skip poll");
-    return;
-  }
+async function poll() {
+  if (busy) return;
   busy = true;
   try {
-    const records = await jobsTable
-      .select({
-        filterByFormula: 'OR({Status} = "Generate", {Status} = "Style")',
-        maxRecords: 1,
-      })
-      .firstPage();
-
-    if (!records.length) {
-      const peek = await jobsTable.select({ maxRecords: 5 }).firstPage();
-      const statuses = peek.map((r) => r.get("Status")).join(", ");
-      log("no jobs. statuses:", statuses || "(none)");
+    const found = await jobs.select({
+      filterByFormula: 'OR({Status}="Generate",{Status}="Style")',
+      maxRecords: 1
+    }).firstPage();
+    if (!found.length) {
+      const peek = await jobs.select({ maxRecords: 5 }).firstPage();
+      log("idle", peek.map((r) => r.get("Status")).join(","));
       return;
     }
-
-    const record = records[0];
-    const mode = record.get("Status");
-    try {
-      await processRecord(record, mode);
-    } catch (err) {
-      log("JOB FAILED", record.id, err.message);
-      if (err.stack) log(err.stack);
-      await bumpFailed(record);
-    }
-  } catch (err) {
-    log("poll error", err.message);
+    try { await run(found[0], found[0].get("Status")); }
+    catch (e) { await fail(found[0], e); }
+  } catch (e) {
+    log("poll", e.message);
   } finally {
     busy = false;
   }
 }
 
-log("worker start");
-log("base", BASE_ID, "table", TABLE_ID);
-log("model", MODEL);
-log("keys", { airtable: !!AIRTABLE_API_KEY, gemini: !!GEMINI_API_KEY });
-
-setInterval(checkForJobs, POLL_MS);
-checkForJobs();
+log("start", BASE_ID, TABLE_ID, MODEL, { at: !!AIRTABLE_API_KEY, gm: !!GEMINI_API_KEY });
+setInterval(poll, POLL_MS);
+poll();

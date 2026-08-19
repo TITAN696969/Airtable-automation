@@ -2,15 +2,18 @@ const Airtable = require("airtable");
 const fetch = require("node-fetch");
 const http = require("http");
 const sharp = require("sharp");
+const crypto = require("crypto");
 
 const AIRTABLE_API_KEY = process.env.AIRTABLE_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const BASE_ID = process.env.AIRTABLE_BASE_ID || "app7381NQaLvJhj2Y";
 const TABLE_ID = process.env.AIRTABLE_TABLE_ID || "tblZLPqHrhyAIGHW9";
 const MODELS_TABLE = process.env.AIRTABLE_MODELS_TABLE || "Models";
-const MODEL = process.env.GEMINI_MODEL || "gemini-3.1-flash-image";
+const MODEL = process.env.GEMINI_MODEL || "gemini-3-pro-image-preview"; // Nano Banana Pro
 const POLL_MS = Number(process.env.POLL_MS || 15000);
+const STALE_MS = Number(process.env.STALE_MS || 20 * 60 * 1000);
 const PORT = process.env.PORT || 3000;
+const WORKER_ID = crypto.randomUUID();
 
 const LOOKS = {
   2: { name: "warm-sun", modulate: { brightness: 1.03, saturation: 1.07, hue: 5 }, linear: [1.05, 2], gamma: 1.02 },
@@ -30,6 +33,21 @@ http.createServer((req, res) => {
 }).listen(PORT, () => console.log("http", PORT));
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function withRetry(fn, { attempts = 3, baseMs = 1000, label = "" } = {}) {
+  let last;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      last = e;
+      log("  retry", label, i + "/" + attempts, e.message);
+      if (i < attempts) await sleep(baseMs * i);
+    }
+  }
+  throw last;
+}
 
 function norm(s) {
   return String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -47,7 +65,7 @@ function atts(record, wanted) {
 
 async function patch(id, fields) {
   try {
-    await jobs.update(id, fields);
+    await withRetry(() => jobs.update(id, fields), { label: "patch " + Object.keys(fields).join(",") });
     return true;
   } catch (e) {
     log("patch fail", Object.keys(fields).join(","), e.message);
@@ -114,8 +132,9 @@ async function generateOne(modelRefs, scene, prompt, i, total) {
     text: "You are an expert image editor. Recreate the scene from the last reference photo. The person must match the first reference photos. Photorealistic, natural skin, high quality. Image " + i + " of " + total + ". " + (prompt || "")
   });
 
+  const MAX_ATTEMPTS = 3;
   let last = null;
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     log("  Gemini", i, "try", attempt);
     const t = Date.now();
     try {
@@ -123,17 +142,20 @@ async function generateOne(modelRefs, scene, prompt, i, total) {
       log("  Gemini", res.status, ((Date.now() - t) / 1000).toFixed(1) + "s");
       if (!res.ok) {
         last = new Error("Gemini " + res.status + " " + JSON.stringify(res.json).slice(0, 240));
+        if (attempt < MAX_ATTEMPTS) await sleep(res.status === 429 ? 15000 * attempt : 2000 * attempt);
         continue;
       }
       const img = extractImage(res.json);
       if (!img) {
         last = new Error("no image " + JSON.stringify(res.json).slice(0, 240));
+        if (attempt < MAX_ATTEMPTS) await sleep(2000 * attempt);
         continue;
       }
       return img;
     } catch (e) {
       last = e;
       log("  Gemini err", e.message);
+      if (attempt < MAX_ATTEMPTS) await sleep(2000 * attempt);
     }
   }
   throw last || new Error("Gemini failed");
@@ -141,15 +163,17 @@ async function generateOne(modelRefs, scene, prompt, i, total) {
 
 async function upload(recordId, field, b64, filename, type) {
   const url = "https://content.airtable.com/v0/" + BASE_ID + "/" + recordId + "/" + encodeURIComponent(field) + "/uploadAttachment";
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { Authorization: "Bearer " + AIRTABLE_API_KEY, "Content-Type": "application/json" },
-    timeout: 60000,
-    body: JSON.stringify({ contentType: type || "image/jpeg", file: b64, filename })
-  });
-  const txt = await r.text();
-  if (!r.ok) throw new Error("upload " + field + " " + r.status + " " + txt.slice(0, 160));
-  log("  uploaded", field, filename);
+  await withRetry(async () => {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: "Bearer " + AIRTABLE_API_KEY, "Content-Type": "application/json" },
+      timeout: 60000,
+      body: JSON.stringify({ contentType: type || "image/jpeg", file: b64, filename })
+    });
+    const txt = await r.text();
+    if (!r.ok) throw new Error("upload " + field + " " + r.status + " " + txt.slice(0, 160));
+    log("  uploaded", field, filename);
+  }, { baseMs: 1500, label: "upload " + field });
 }
 
 async function applyLook(buffer, look) {
@@ -187,7 +211,7 @@ async function fillStyledOutputs(id, buffers) {
   return saved;
 }
 
-async function runAi(record) {
+async function runAi(record, noteT) {
   const id = record.id;
   const linked = record.get("Model") || [];
   if (!linked.length) throw new Error("No Model selected");
@@ -205,7 +229,7 @@ async function runAi(record) {
 
   for (let i = 0; i < queue.length; i++) {
     log("AI", i + 1, "/", queue.length);
-    await note(id, "Generating Output 1 image " + (i + 1) + "/" + queue.length);
+    await noteT("Generating Output 1 image " + (i + 1) + "/" + queue.length);
     try {
       const img = await generateOne(modelRefs, queue[i], prompt, i + 1, queue.length);
       await upload(id, "Output 1", img.data, "output_1_" + (i + 1) + ".png", img.mime);
@@ -232,18 +256,55 @@ async function loadOutput1(record) {
   return buffers;
 }
 
-async function run(record, mode) {
+// Claims a record by stamping a unique, parseable tag into Notes, then re-reading
+// it back to make sure a concurrent worker didn't win the same record in between.
+async function claim(record, mode) {
+  const tag = "[claim:" + WORKER_ID + ";mode=" + mode + ";at=" + Date.now() + "]";
+  const ok = await patch(record.id, { Status: "Generating", Notes: tag + " Started (" + mode + ")" });
+  if (!ok) return null;
+  try {
+    const fresh = await jobs.find(record.id);
+    const notes = fresh.get("Notes") || "";
+    return notes.startsWith(tag) ? tag : null;
+  } catch (e) {
+    log("claim verify fail", e.message);
+    return null;
+  }
+}
+
+// Requeues records stuck in "Generating" (e.g. the worker crashed mid-run) once
+// their claim tag is older than STALE_MS. Only records claimed by this same
+// tagging scheme can be recovered; untagged records are left alone.
+const CLAIM_RE = /^\[claim:[^;]+;mode=(Generate|Style);at=(\d+)\]/;
+
+async function requeueStale() {
+  const stuck = await jobs.select({ filterByFormula: '{Status}="Generating"', maxRecords: 10 }).firstPage();
+  if (!stuck.length) {
+    log("idle");
+    return;
+  }
+  for (const rec of stuck) {
+    const m = CLAIM_RE.exec(rec.get("Notes") || "");
+    if (!m) continue;
+    const age = Date.now() - Number(m[2]);
+    if (age < STALE_MS) continue;
+    log("REQUEUE stale", rec.id, "mode", m[1], "age(ms)", age);
+    await patch(rec.id, { Status: m[1] });
+    await note(rec.id, "Requeued after stale timeout (" + Math.round(age / 1000) + "s)");
+  }
+}
+
+async function run(record, mode, tag) {
   const id = record.id;
   log("START", id, mode);
-  await patch(id, { Status: "Generating" });
-  await note(id, "Started (" + mode + ")");
+  const noteT = (text) => note(id, tag + " " + text);
 
   let buffers = [];
   if (mode === "Style") {
     buffers = await loadOutput1(record);
     if (!buffers.length) throw new Error("Output 1 is empty — generate first");
   } else {
-    buffers = await runAi(record);
+    buffers = await runAi(record, noteT);
   }
 
   const styled = await fillStyledOutputs(id, buffers);
@@ -262,18 +323,24 @@ async function poll() {
     }).firstPage();
 
     if (!found.length) {
-      const peek = await jobs.select({ maxRecords: 6 }).firstPage();
-      log("idle", peek.map((r) => (r.get("Status") || "?")).join(","));
+      await requeueStale();
       return;
     }
 
     const rec = found[0];
+    const mode = rec.get("Status");
+    const tag = await claim(rec, mode);
+    if (!tag) {
+      log("SKIP", rec.id, "lost claim race");
+      return;
+    }
+
     try {
-      await run(rec, rec.get("Status"));
+      await run(rec, mode, tag);
     } catch (e) {
       log("FAIL", rec.id, e.message);
       if (e.stack) log(e.stack);
-      await note(rec.id, "FAILED: " + e.message);
+      await note(rec.id, tag + " FAILED: " + e.message);
       await patch(rec.id, { Status: "Failed" });
     }
   } catch (e) {
@@ -283,6 +350,6 @@ async function poll() {
   }
 }
 
-log("worker", { base: BASE_ID, table: TABLE_ID, model: MODEL, at: !!AIRTABLE_API_KEY, gm: !!GEMINI_API_KEY });
+log("worker", { base: BASE_ID, table: TABLE_ID, model: MODEL, workerId: WORKER_ID, at: !!AIRTABLE_API_KEY, gm: !!GEMINI_API_KEY });
 setInterval(poll, POLL_MS);
 poll();

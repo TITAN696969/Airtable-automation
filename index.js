@@ -178,10 +178,6 @@ async function upload(recordId, field, b64, filename, type) {
 
 async function applyLook(buffer, look) {
   let img = sharp(buffer, { failOn: "none" }).rotate();
-  const meta = await img.metadata();
-  if (Math.max(meta.width || 0, meta.height || 0) > 2048) {
-    img = img.resize({ width: 2048, height: 2048, fit: "inside" });
-  }
   if (look.modulate) img = img.modulate(look.modulate);
   if (look.linear) img = img.linear(look.linear[0], look.linear[1]);
   if (look.gamma) img = img.gamma(look.gamma);

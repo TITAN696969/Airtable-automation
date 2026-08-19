@@ -3,6 +3,8 @@ const fetch = require("node-fetch");
 const http = require("http");
 const sharp = require("sharp");
 const crypto = require("crypto");
+const { Readable } = require("stream");
+const { google } = require("googleapis");
 
 const AIRTABLE_API_KEY = process.env.AIRTABLE_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
@@ -14,6 +16,13 @@ const POLL_MS = Number(process.env.POLL_MS || 15000);
 const STALE_MS = Number(process.env.STALE_MS || 20 * 60 * 1000);
 const PORT = process.env.PORT || 3000;
 const WORKER_ID = crypto.randomUUID();
+
+// Drive uploads are optional: set both env vars to enable. GOOGLE_SERVICE_ACCOUNT_JSON
+// is the service account key JSON, base64-encoded (avoids env var newline issues).
+// DRIVE_ROOT_FOLDER_ID must be a folder inside a Shared Drive that the service
+// account's client_email has been added to (Content Manager or higher).
+const DRIVE_ROOT_FOLDER_ID = process.env.DRIVE_ROOT_FOLDER_ID || "";
+const DRIVE_ENABLED = !!(process.env.GOOGLE_SERVICE_ACCOUNT_JSON && DRIVE_ROOT_FOLDER_ID);
 
 const LOOKS = {
   2: { name: "warm-sun", modulate: { brightness: 1.03, saturation: 1.07, hue: 5 }, linear: [1.05, 2], gamma: 1.02 },
@@ -61,6 +70,102 @@ function atts(record, wanted) {
     if (Array.isArray(v) && v[0] && v[0].url) return v;
   }
   return [];
+}
+
+let driveClient = null;
+function getDrive() {
+  if (!DRIVE_ENABLED) return null;
+  if (driveClient) return driveClient;
+  const creds = JSON.parse(Buffer.from(process.env.GOOGLE_SERVICE_ACCOUNT_JSON, "base64").toString("utf8"));
+  const auth = new google.auth.GoogleAuth({ credentials: creds, scopes: ["https://www.googleapis.com/auth/drive"] });
+  driveClient = google.drive({ version: "v3", auth });
+  return driveClient;
+}
+
+function safeFolderName(s) {
+  return String(s || "").replace(/[\/\\]/g, "-").trim().slice(0, 200) || "Untitled";
+}
+
+function jobLabel(record) {
+  const fields = record.fields || {};
+  for (const key of Object.keys(fields)) {
+    const n = norm(key);
+    if (n !== "name" && n !== "title" && n !== "jobname") continue;
+    const v = fields[key];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return record.id;
+}
+
+async function getModelName(record) {
+  const linked = record.get("Model") || [];
+  if (!linked.length) return null;
+  try {
+    const modelRec = await models.find(linked[0]);
+    return modelRec.get("Name") || linked[0];
+  } catch (e) {
+    log("drive model lookup fail", e.message);
+    return null;
+  }
+}
+
+const folderCache = new Map();
+
+async function getOrCreateFolder(name, parentId) {
+  const key = parentId + "::" + name;
+  if (folderCache.has(key)) return folderCache.get(key);
+  const p = (async () => {
+    const drive = getDrive();
+    const q = "name='" + name.replace(/'/g, "\\'") + "' and '" + parentId + "' in parents" +
+      " and mimeType='application/vnd.google-apps.folder' and trashed=false";
+    const found = await drive.files.list({
+      q,
+      fields: "files(id,name)",
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
+      corpora: "allDrives"
+    });
+    if (found.data.files && found.data.files.length) return found.data.files[0].id;
+    const created = await drive.files.create({
+      requestBody: { name, mimeType: "application/vnd.google-apps.folder", parents: [parentId] },
+      fields: "id",
+      supportsAllDrives: true
+    });
+    return created.data.id;
+  })();
+  folderCache.set(key, p);
+  p.catch(() => folderCache.delete(key)); // don't let a transient failure poison the cache forever
+  return p;
+}
+
+// Resolves (and creates if needed) the "<Model>/<Job>" Drive folder for a record.
+// Never throws — Drive is a best-effort side channel alongside Airtable uploads.
+async function resolveDriveFolder(record) {
+  if (!DRIVE_ENABLED) return null;
+  try {
+    const modelName = await getModelName(record);
+    const modelFolder = await getOrCreateFolder(safeFolderName(modelName || "Unassigned"), DRIVE_ROOT_FOLDER_ID);
+    return await getOrCreateFolder(safeFolderName(jobLabel(record)), modelFolder);
+  } catch (e) {
+    log("drive folder fail", e.message);
+    return null;
+  }
+}
+
+async function uploadToDrive(folderId, filename, buffer, mimeType) {
+  if (!folderId) return;
+  try {
+    const drive = getDrive();
+    await withRetry(() => drive.files.create({
+      requestBody: { name: filename, parents: [folderId] },
+      media: { mimeType: mimeType || "image/jpeg", body: Readable.from(buffer) },
+      fields: "id",
+      supportsAllDrives: true
+    }), { label: "drive upload " + filename });
+    log("  drive uploaded", filename);
+  } catch (e) {
+    log("  drive upload skip", filename, e.message);
+  }
 }
 
 async function patch(id, fields) {
@@ -185,7 +290,7 @@ async function applyLook(buffer, look) {
   return img.jpeg({ quality: 90, mozjpeg: true }).toBuffer();
 }
 
-async function fillStyledOutputs(id, buffers) {
+async function fillStyledOutputs(id, buffers, driveFolder) {
   if (!buffers.length) throw new Error("nothing to style");
   log("styling", buffers.length, "into Output 2-5");
   let saved = 0;
@@ -197,7 +302,9 @@ async function fillStyledOutputs(id, buffers) {
     for (let i = 0; i < buffers.length; i++) {
       try {
         const out = await applyLook(buffers[i], look);
-        await upload(id, field, out.toString("base64"), "output_" + n + "_" + look.name + "_" + (i + 1) + ".jpg", "image/jpeg");
+        const filename = "output_" + n + "_" + look.name + "_" + (i + 1) + ".jpg";
+        await upload(id, field, out.toString("base64"), filename, "image/jpeg");
+        await uploadToDrive(driveFolder, filename, out, "image/jpeg");
         saved += 1;
       } catch (e) {
         log("skip", field, i + 1, e.message);
@@ -207,7 +314,7 @@ async function fillStyledOutputs(id, buffers) {
   return saved;
 }
 
-async function runAi(record, noteT) {
+async function runAi(record, noteT, driveFolder) {
   const id = record.id;
   const linked = record.get("Model") || [];
   if (!linked.length) throw new Error("No Model selected");
@@ -228,8 +335,11 @@ async function runAi(record, noteT) {
     await noteT("Generating Output 1 image " + (i + 1) + "/" + queue.length);
     try {
       const img = await generateOne(modelRefs, queue[i], prompt, i + 1, queue.length);
-      await upload(id, "Output 1", img.data, "output_1_" + (i + 1) + ".png", img.mime);
-      buffers.push(Buffer.from(img.data, "base64"));
+      const filename = "output_1_" + (i + 1) + ".png";
+      await upload(id, "Output 1", img.data, filename, img.mime);
+      const buf = Buffer.from(img.data, "base64");
+      await uploadToDrive(driveFolder, filename, buf, img.mime);
+      buffers.push(buf);
     } catch (e) {
       lastErr = e;
       log("AI skip", i + 1, e.message);
@@ -294,16 +404,17 @@ async function run(record, mode, tag) {
   const id = record.id;
   log("START", id, mode);
   const noteT = (text) => note(id, tag + " " + text);
+  const driveFolder = await resolveDriveFolder(record);
 
   let buffers = [];
   if (mode === "Style") {
     buffers = await loadOutput1(record);
     if (!buffers.length) throw new Error("Output 1 is empty — generate first");
   } else {
-    buffers = await runAi(record, noteT);
+    buffers = await runAi(record, noteT, driveFolder);
   }
 
-  const styled = await fillStyledOutputs(id, buffers);
+  const styled = await fillStyledOutputs(id, buffers, driveFolder);
   await patch(id, { Status: "In Review" });
   await note(id, "Done. Output 1 = " + buffers.length + " AI photos. Output 2-5 styled (" + styled + " files).");
   log("DONE", id);
@@ -346,6 +457,6 @@ async function poll() {
   }
 }
 
-log("worker", { base: BASE_ID, table: TABLE_ID, model: MODEL, workerId: WORKER_ID, at: !!AIRTABLE_API_KEY, gm: !!GEMINI_API_KEY });
+log("worker", { base: BASE_ID, table: TABLE_ID, model: MODEL, workerId: WORKER_ID, at: !!AIRTABLE_API_KEY, gm: !!GEMINI_API_KEY, drive: DRIVE_ENABLED });
 setInterval(poll, POLL_MS);
 poll();

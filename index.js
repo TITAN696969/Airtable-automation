@@ -17,12 +17,21 @@ const STALE_MS = Number(process.env.STALE_MS || 20 * 60 * 1000);
 const PORT = process.env.PORT || 3000;
 const WORKER_ID = crypto.randomUUID();
 
-// Drive uploads are optional: set both env vars to enable. GOOGLE_SERVICE_ACCOUNT_JSON
-// is the service account key JSON, base64-encoded (avoids env var newline issues).
-// DRIVE_ROOT_FOLDER_ID must be a folder inside a Shared Drive that the service
-// account's client_email has been added to (Content Manager or higher).
+// Drive uploads are optional. Two auth modes, pick one:
+//   - Service account: set GOOGLE_SERVICE_ACCOUNT_JSON (the key JSON, base64-encoded)
+//     and point DRIVE_ROOT_FOLDER_ID at a folder inside a Shared Drive the service
+//     account's client_email has been added to (Content Manager+). Fully headless.
+//   - OAuth as yourself: set GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, and
+//     GOOGLE_OAUTH_REFRESH_TOKEN (from scripts/drive-oauth-setup.js, run once locally),
+//     and point DRIVE_ROOT_FOLDER_ID at any regular folder in your own Drive. Uploads
+//     use your personal quota, no Shared Drive needed.
 const DRIVE_ROOT_FOLDER_ID = process.env.DRIVE_ROOT_FOLDER_ID || "";
-const DRIVE_ENABLED = !!(process.env.GOOGLE_SERVICE_ACCOUNT_JSON && DRIVE_ROOT_FOLDER_ID);
+const DRIVE_AUTH_MODE = process.env.GOOGLE_SERVICE_ACCOUNT_JSON
+  ? "service_account"
+  : (process.env.GOOGLE_OAUTH_CLIENT_ID && process.env.GOOGLE_OAUTH_CLIENT_SECRET && process.env.GOOGLE_OAUTH_REFRESH_TOKEN)
+    ? "oauth"
+    : null;
+const DRIVE_ENABLED = !!(DRIVE_AUTH_MODE && DRIVE_ROOT_FOLDER_ID);
 
 const LOOKS = {
   2: { name: "warm-sun", modulate: { brightness: 1.03, saturation: 1.07, hue: 5 }, linear: [1.05, 2], gamma: 1.02 },
@@ -76,8 +85,15 @@ let driveClient = null;
 function getDrive() {
   if (!DRIVE_ENABLED) return null;
   if (driveClient) return driveClient;
-  const creds = JSON.parse(Buffer.from(process.env.GOOGLE_SERVICE_ACCOUNT_JSON, "base64").toString("utf8"));
-  const auth = new google.auth.GoogleAuth({ credentials: creds, scopes: ["https://www.googleapis.com/auth/drive"] });
+  let auth;
+  if (DRIVE_AUTH_MODE === "service_account") {
+    const creds = JSON.parse(Buffer.from(process.env.GOOGLE_SERVICE_ACCOUNT_JSON, "base64").toString("utf8"));
+    auth = new google.auth.GoogleAuth({ credentials: creds, scopes: ["https://www.googleapis.com/auth/drive"] });
+  } else {
+    const oauth2 = new google.auth.OAuth2(process.env.GOOGLE_OAUTH_CLIENT_ID, process.env.GOOGLE_OAUTH_CLIENT_SECRET);
+    oauth2.setCredentials({ refresh_token: process.env.GOOGLE_OAUTH_REFRESH_TOKEN });
+    auth = oauth2;
+  }
   driveClient = google.drive({ version: "v3", auth });
   return driveClient;
 }

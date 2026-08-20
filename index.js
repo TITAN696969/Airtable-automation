@@ -11,7 +11,7 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const BASE_ID = process.env.AIRTABLE_BASE_ID || "app7381NQaLvJhj2Y";
 const TABLE_ID = process.env.AIRTABLE_TABLE_ID || "tblZLPqHrhyAIGHW9";
 const MODELS_TABLE = process.env.AIRTABLE_MODELS_TABLE || "Models";
-const MODEL = process.env.GEMINI_MODEL || "gemini-3-pro-image-preview"; // Nano Banana Pro — Flash has visibly weaker multi-image face-lock
+const MODEL = process.env.GEMINI_MODEL || "gemini-3.1-flash-image"; // Nano Banana (Flash)
 const POLL_MS = Number(process.env.POLL_MS || 15000);
 const STALE_MS = Number(process.env.STALE_MS || 20 * 60 * 1000);
 const PORT = process.env.PORT || 3000;
@@ -36,6 +36,9 @@ const DRIVE_ENABLED = !!(DRIVE_AUTH_MODE && DRIVE_ROOT_FOLDER_ID);
 // exist in the table (as a URL or single-line text field) — Airtable rejects
 // writes to unknown field names, which patch() just logs and moves past.
 const DRIVE_LINK_FIELD = process.env.DRIVE_LINK_FIELD || "Drive Folder";
+// How often the delete-sync sweep runs (it's independent of POLL_MS, which
+// stays fast for job pickup — this stays slow since it scans every job record).
+const SYNC_SWEEP_MS = Number(process.env.SYNC_SWEEP_MS || 5 * 60 * 1000);
 
 const LOOKS = {
   2: { name: "warm-sun", modulate: { brightness: 1.03, saturation: 1.07, hue: 5 }, linear: [1.05, 2], gamma: 1.02 },
@@ -185,6 +188,84 @@ async function uploadToDrive(folderId, filename, buffer, mimeType) {
     log("  drive uploaded", filename);
   } catch (e) {
     log("  drive upload skip", filename, e.message);
+  }
+}
+
+function driveFolderIdFromLink(link) {
+  const m = /\/folders\/([a-zA-Z0-9_-]+)/.exec(String(link || ""));
+  return m ? m[1] : null;
+}
+
+async function listDriveFiles(folderId) {
+  const drive = getDrive();
+  const files = [];
+  let pageToken;
+  do {
+    const res = await drive.files.list({
+      q: "'" + folderId + "' in parents and trashed=false",
+      fields: "nextPageToken, files(id,name)",
+      pageSize: 200,
+      pageToken,
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
+      corpora: "allDrives"
+    });
+    files.push(...(res.data.files || []));
+    pageToken = res.data.nextPageToken;
+  } while (pageToken);
+  return files;
+}
+
+// Trashes (not permanently deletes) so an accidental Airtable deletion is
+// still recoverable from Drive's trash for a while.
+async function trashDriveFile(fileId) {
+  const drive = getDrive();
+  await drive.files.update({ fileId, requestBody: { trashed: true }, supportsAllDrives: true });
+}
+
+// Periodic sweep: for every record with a Drive Folder link, removes any Drive
+// file whose matching Airtable attachment (by filename) is gone — i.e. the
+// user deleted an Output image in Airtable, so its Drive copy gets cleaned up.
+async function syncDriveDeletions() {
+  if (!DRIVE_ENABLED) return;
+  try {
+    const records = await jobs.select({
+      filterByFormula: "{" + DRIVE_LINK_FIELD + "} != ''",
+      maxRecords: 50,
+      fields: ["Output 1", "Output 2", "Output 3", "Output 4", "Output 5", DRIVE_LINK_FIELD]
+    }).firstPage();
+
+    for (const rec of records) {
+      const folderId = driveFolderIdFromLink(rec.get(DRIVE_LINK_FIELD));
+      if (!folderId) continue;
+
+      const keep = new Set();
+      for (const n of [1, 2, 3, 4, 5]) {
+        for (const att of atts(rec, "Output " + n)) {
+          if (att.filename) keep.add(att.filename);
+        }
+      }
+
+      let driveFiles;
+      try {
+        driveFiles = await listDriveFiles(folderId);
+      } catch (e) {
+        log("sync list fail", rec.id, e.message);
+        continue;
+      }
+
+      for (const f of driveFiles) {
+        if (keep.has(f.name)) continue;
+        try {
+          await trashDriveFile(f.id);
+          log("sync trashed", rec.id, f.name);
+        } catch (e) {
+          log("sync trash fail", rec.id, f.name, e.message);
+        }
+      }
+    }
+  } catch (e) {
+    log("sync sweep fail", e.message);
   }
 }
 
@@ -442,10 +523,12 @@ async function run(record, mode, tag) {
   }
 
   const styled = await fillStyledOutputs(id, buffers, driveFolder);
-  await patch(id, { Status: "In Review" });
+  await patch(id, { Status: "Done" });
   await note(id, "Done. Output 1 = " + buffers.length + " AI photos. Output 2-5 styled (" + styled + " files).");
   log("DONE", id);
 }
+
+let lastSweepAt = 0;
 
 async function poll() {
   if (busy) return;
@@ -458,6 +541,10 @@ async function poll() {
 
     if (!found.length) {
       await requeueStale();
+      if (Date.now() - lastSweepAt >= SYNC_SWEEP_MS) {
+        lastSweepAt = Date.now();
+        await syncDriveDeletions();
+      }
       return;
     }
 

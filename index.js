@@ -36,6 +36,11 @@ const DRIVE_ENABLED = !!(DRIVE_AUTH_MODE && DRIVE_ROOT_FOLDER_ID);
 // exist in the table (as a URL or single-line text field) — Airtable rejects
 // writes to unknown field names, which patch() just logs and moves past.
 const DRIVE_LINK_FIELD = process.env.DRIVE_LINK_FIELD || "Drive Folder";
+// Airtable field on a reroll-duplicate record holding the source record's
+// Drive Folder link, so resolveDriveFolder knows to allocate a sibling
+// variant instead of a fresh top-level Carousel number. Must exist in the
+// table (text or URL field) same as DRIVE_LINK_FIELD.
+const REROLL_OF_FIELD = process.env.REROLL_OF_FIELD || "Reroll Of";
 // How often the delete-sync sweep runs (it's independent of POLL_MS, which
 // stays fast for job pickup — this stays slow since it scans every job record).
 const SYNC_SWEEP_MS = Number(process.env.SYNC_SWEEP_MS || 5 * 60 * 1000);
@@ -184,11 +189,10 @@ async function nextCarouselNumber(modelFolder) {
   return max + 1;
 }
 
-// When a record with completed Output 1 content gets a deliberate reroll
-// (Generate run again on purpose, not a retry-after-failure), this allocates
-// a sibling folder — "Carousel 2" -> "Carousel 2_1" -> "Carousel 2_2" — so the
-// old and new generations don't collide or mix in Drive. Falls back to
-// reusing the original folder if its name can't be parsed for some reason.
+// Allocates a sibling variant folder for a reroll — "Carousel 2" -> "Carousel
+// 2_1" -> "Carousel 2_2" — so a reroll's new generation never collides or
+// mixes with the record it was rerolled from. Falls back to reusing the
+// source folder if its name can't be parsed for some reason.
 async function allocateVariantFolder(existingFolderId) {
   const drive = getDrive();
   const meta = await drive.files.get({ fileId: existingFolderId, fields: "name,parents", supportsAllDrives: true });
@@ -214,27 +218,23 @@ async function allocateVariantFolder(existingFolderId) {
   return await getOrCreateFolder("Carousel " + base + "_" + (maxSuffix + 1), parent);
 }
 
-// Resolves the "<Model>/Carousel N" Drive folder for a record.
-// - Brand new record (no Drive Folder link yet): allocates the next
-//   "Carousel N" under its Model's folder.
-// - Style run, or a Generate run resuming after a crash/failure: reuses the
-//   existing folder so partial or re-styled content lands alongside it.
-// - Deliberate Generate reroll of a record that already has completed
-//   Output 1 images (and wasn't just retrying a failure): allocates a new
-//   "Carousel N_M" sibling instead of overwriting the previous generation.
+// Resolves the "<Model>/Carousel N" Drive folder for a record. A record's own
+// Drive Folder link, once set, is never changed again — it stays paired with
+// that record for its whole lifetime so the delete-sync sweep always has a
+// stable target. There are exactly three cases:
+// - This record already has its own Drive Folder link: reuse it as-is.
+// - This record has a "Reroll Of" link (it was created by handleReroll as a
+//   duplicate): allocate a new sibling variant off of THAT folder.
+// - Brand new, unrelated record: allocate the next fresh "Carousel N".
 // Never throws — Drive is a best-effort side channel alongside Airtable uploads.
-async function resolveDriveFolder(record, mode) {
+async function resolveDriveFolder(record) {
   if (!DRIVE_ENABLED) return null;
   try {
     const existingId = driveFolderIdFromLink(record.get(DRIVE_LINK_FIELD));
-    if (existingId) {
-      const hasExistingOutput = atts(record, "Output 1").length > 0;
-      const wasFailed = String(record.get("Notes") || "").includes("FAILED:");
-      if (mode === "Generate" && hasExistingOutput && !wasFailed) {
-        return await allocateVariantFolder(existingId);
-      }
-      return existingId;
-    }
+    if (existingId) return existingId;
+
+    const rerollOfId = driveFolderIdFromLink(record.get(REROLL_OF_FIELD));
+    if (rerollOfId) return await allocateVariantFolder(rerollOfId);
 
     const modelName = await getModelName(record);
     const modelFolder = await getOrCreateFolder(safeFolderName(modelName || "Unassigned"), DRIVE_ROOT_FOLDER_ID);
@@ -619,7 +619,7 @@ async function run(record, mode, tag) {
   const id = record.id;
   log("START", id, mode);
   const noteT = (text) => note(id, tag + " " + text);
-  const driveFolder = await resolveDriveFolder(record, mode);
+  const driveFolder = await resolveDriveFolder(record);
   if (driveFolder) {
     await patch(id, { [DRIVE_LINK_FIELD]: "https://drive.google.com/drive/folders/" + driveFolder });
   }
@@ -640,12 +640,32 @@ async function run(record, mode, tag) {
 
 let lastSweepAt = 0;
 
+// Triggered by setting a record's Status to "Reroll": creates a fresh
+// duplicate record (Model, Prompt, and Input References copied over) that
+// will generate as a new sibling variant of this record's carousel — without
+// ever touching this record's own Output fields or Drive Folder link. Keeps
+// every record's Drive folder pairing permanent, so delete-sync always has a
+// stable target instead of one that moves out from under it on a reroll.
+async function handleReroll(record) {
+  const id = record.id;
+  const fields = {
+    Model: record.get("Model") || [],
+    Prompt: record.get("Prompt") || "",
+    "Input References": record.get("Input References") || [],
+    [REROLL_OF_FIELD]: record.get(DRIVE_LINK_FIELD) || "",
+    Status: "Generate"
+  };
+  const created = await jobs.create(fields, { typecast: true });
+  log("REROLL", id, "->", created.id);
+  await patch(id, { Status: "Done" });
+}
+
 async function poll() {
   if (busy) return;
   busy = true;
   try {
     const found = await jobs.select({
-      filterByFormula: 'OR({Status}="Generate",{Status}="Style")',
+      filterByFormula: 'OR({Status}="Generate",{Status}="Style",{Status}="Reroll")',
       maxRecords: 1
     }).firstPage();
 
@@ -660,6 +680,17 @@ async function poll() {
 
     const rec = found[0];
     const mode = rec.get("Status");
+
+    if (mode === "Reroll") {
+      try {
+        await handleReroll(rec);
+      } catch (e) {
+        log("FAIL reroll", rec.id, e.message);
+        await patch(rec.id, { Status: "Failed" });
+      }
+      return;
+    }
+
     const tag = await claim(rec, mode);
     if (!tag) {
       log("SKIP", rec.id, "lost claim race");

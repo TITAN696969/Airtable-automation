@@ -184,16 +184,57 @@ async function nextCarouselNumber(modelFolder) {
   return max + 1;
 }
 
-// Resolves the "<Model>/Carousel N" Drive folder for a record. If this record
-// was already assigned one (its Drive Folder link is already set — e.g. a
-// Style run following an earlier Generate run), reuses that same folder
-// instead of allocating a new number. Never throws — Drive is a best-effort
-// side channel alongside Airtable uploads.
-async function resolveDriveFolder(record) {
+// When a record with completed Output 1 content gets a deliberate reroll
+// (Generate run again on purpose, not a retry-after-failure), this allocates
+// a sibling folder — "Carousel 2" -> "Carousel 2_1" -> "Carousel 2_2" — so the
+// old and new generations don't collide or mix in Drive. Falls back to
+// reusing the original folder if its name can't be parsed for some reason.
+async function allocateVariantFolder(existingFolderId) {
+  const drive = getDrive();
+  const meta = await drive.files.get({ fileId: existingFolderId, fields: "name,parents", supportsAllDrives: true });
+  const parent = (meta.data.parents || [])[0];
+  const m = /^Carousel (\d+)/.exec(meta.data.name || "");
+  if (!parent || !m) return existingFolderId;
+
+  const base = m[1];
+  const res = await drive.files.list({
+    q: "'" + parent + "' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+    fields: "files(id,name)",
+    pageSize: 1000,
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
+    corpora: "allDrives"
+  });
+  const siblingRe = new RegExp("^Carousel " + base + "(?:_(\\d+))?$");
+  let maxSuffix = 0;
+  for (const f of res.data.files || []) {
+    const sm = siblingRe.exec(f.name || "");
+    if (sm) maxSuffix = Math.max(maxSuffix, sm[1] ? Number(sm[1]) : 0);
+  }
+  return await getOrCreateFolder("Carousel " + base + "_" + (maxSuffix + 1), parent);
+}
+
+// Resolves the "<Model>/Carousel N" Drive folder for a record.
+// - Brand new record (no Drive Folder link yet): allocates the next
+//   "Carousel N" under its Model's folder.
+// - Style run, or a Generate run resuming after a crash/failure: reuses the
+//   existing folder so partial or re-styled content lands alongside it.
+// - Deliberate Generate reroll of a record that already has completed
+//   Output 1 images (and wasn't just retrying a failure): allocates a new
+//   "Carousel N_M" sibling instead of overwriting the previous generation.
+// Never throws — Drive is a best-effort side channel alongside Airtable uploads.
+async function resolveDriveFolder(record, mode) {
   if (!DRIVE_ENABLED) return null;
   try {
     const existingId = driveFolderIdFromLink(record.get(DRIVE_LINK_FIELD));
-    if (existingId) return existingId;
+    if (existingId) {
+      const hasExistingOutput = atts(record, "Output 1").length > 0;
+      const wasFailed = String(record.get("Notes") || "").includes("FAILED:");
+      if (mode === "Generate" && hasExistingOutput && !wasFailed) {
+        return await allocateVariantFolder(existingId);
+      }
+      return existingId;
+    }
 
     const modelName = await getModelName(record);
     const modelFolder = await getOrCreateFolder(safeFolderName(modelName || "Unassigned"), DRIVE_ROOT_FOLDER_ID);
@@ -578,7 +619,7 @@ async function run(record, mode, tag) {
   const id = record.id;
   log("START", id, mode);
   const noteT = (text) => note(id, tag + " " + text);
-  const driveFolder = await resolveDriveFolder(record);
+  const driveFolder = await resolveDriveFolder(record, mode);
   if (driveFolder) {
     await patch(id, { [DRIVE_LINK_FIELD]: "https://drive.google.com/drive/folders/" + driveFolder });
   }

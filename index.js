@@ -335,7 +335,10 @@ async function syncDriveDeletions() {
 
 async function patch(id, fields) {
   try {
-    await withRetry(() => jobs.update(id, fields), { label: "patch " + Object.keys(fields).join(",") });
+    // typecast lets Airtable auto-create a new Single Select option (e.g. a
+    // Status value that doesn't exist in the field's option list yet)
+    // instead of rejecting the write outright.
+    await withRetry(() => jobs.update(id, fields, { typecast: true }), { label: "patch " + Object.keys(fields).join(",") });
     return true;
   } catch (e) {
     log("patch fail", Object.keys(fields).join(","), e.message);

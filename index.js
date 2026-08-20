@@ -323,8 +323,10 @@ async function fillStyledOutputs(id, buffers, driveFolder) {
       try {
         const out = await applyLook(buffers[i], look);
         const filename = "output_" + n + "_" + look.name + "_" + (i + 1) + ".jpg";
-        await upload(id, field, out.toString("base64"), filename, "image/jpeg");
-        await uploadToDrive(driveFolder, filename, out, "image/jpeg");
+        await Promise.all([
+          upload(id, field, out.toString("base64"), filename, "image/jpeg"),
+          uploadToDrive(driveFolder, filename, out, "image/jpeg")
+        ]);
         saved += 1;
       } catch (e) {
         log("skip", field, i + 1, e.message);
@@ -356,9 +358,11 @@ async function runAi(record, noteT, driveFolder) {
     try {
       const img = await generateOne(modelRefs, queue[i], prompt, i + 1, queue.length);
       const filename = "output_1_" + (i + 1) + ".png";
-      await upload(id, "Output 1", img.data, filename, img.mime);
       const buf = Buffer.from(img.data, "base64");
-      await uploadToDrive(driveFolder, filename, buf, img.mime);
+      await Promise.all([
+        upload(id, "Output 1", img.data, filename, img.mime),
+        uploadToDrive(driveFolder, filename, buf, img.mime)
+      ]);
       buffers.push(buf);
     } catch (e) {
       lastErr = e;

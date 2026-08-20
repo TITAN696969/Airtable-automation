@@ -648,15 +648,25 @@ let lastSweepAt = 0;
 // stable target instead of one that moves out from under it on a reroll.
 async function handleReroll(record) {
   const id = record.id;
-  const fields = {
+  // Create the core duplicate first, without Reroll Of — if that field
+  // doesn't exist in the table, Airtable rejects the ENTIRE write on one
+  // unknown field, which would otherwise block the duplicate from being
+  // created at all. Stamping Reroll Of as a separate patch() afterward means
+  // a missing field just degrades to "untagged new Carousel" instead of a
+  // silent total failure.
+  const created = await jobs.create({
     Model: record.get("Model") || [],
     Prompt: record.get("Prompt") || "",
     "Input References": record.get("Input References") || [],
-    [REROLL_OF_FIELD]: record.get(DRIVE_LINK_FIELD) || "",
     Status: "Generate"
-  };
-  const created = await jobs.create(fields, { typecast: true });
+  }, { typecast: true });
   log("REROLL", id, "->", created.id);
+
+  const rerollLink = record.get(DRIVE_LINK_FIELD);
+  if (rerollLink) {
+    await patch(created.id, { [REROLL_OF_FIELD]: rerollLink });
+  }
+
   await patch(id, { Status: "Done" });
 }
 

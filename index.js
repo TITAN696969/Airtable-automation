@@ -53,6 +53,14 @@ const models = root(MODELS_TABLE);
 let busy = false;
 
 http.createServer((req, res) => {
+  if (req.url === "/sync-drive") {
+    syncDriveDeletions()
+      .then(() => console.log(new Date().toISOString(), "manual sync done"))
+      .catch((e) => console.log(new Date().toISOString(), "manual sync fail", e.message));
+    res.writeHead(202, { "Content-Type": "text/plain" });
+    res.end("sync triggered, check logs\n");
+    return;
+  }
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("ok\n");
 }).listen(PORT, () => console.log("http", PORT));

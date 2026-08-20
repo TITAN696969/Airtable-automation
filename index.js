@@ -32,6 +32,10 @@ const DRIVE_AUTH_MODE = process.env.GOOGLE_SERVICE_ACCOUNT_JSON
     ? "oauth"
     : null;
 const DRIVE_ENABLED = !!(DRIVE_AUTH_MODE && DRIVE_ROOT_FOLDER_ID);
+// Airtable field the per-job Drive folder link gets written into. Must already
+// exist in the table (as a URL or single-line text field) — Airtable rejects
+// writes to unknown field names, which patch() just logs and moves past.
+const DRIVE_LINK_FIELD = process.env.DRIVE_LINK_FIELD || "Drive Folder";
 
 const LOOKS = {
   2: { name: "warm-sun", modulate: { brightness: 1.03, saturation: 1.07, hue: 5 }, linear: [1.05, 2], gamma: 1.02 },
@@ -421,6 +425,9 @@ async function run(record, mode, tag) {
   log("START", id, mode);
   const noteT = (text) => note(id, tag + " " + text);
   const driveFolder = await resolveDriveFolder(record);
+  if (driveFolder) {
+    await patch(id, { [DRIVE_LINK_FIELD]: "https://drive.google.com/drive/folders/" + driveFolder });
+  }
 
   let buffers = [];
   if (mode === "Style") {

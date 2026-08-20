@@ -109,15 +109,9 @@ function safeFolderName(s) {
   return String(s || "").replace(/[\/\\]/g, "-").trim().slice(0, 200) || "Untitled";
 }
 
-function jobLabel(record) {
-  const fields = record.fields || {};
-  for (const key of Object.keys(fields)) {
-    const n = norm(key);
-    if (n !== "name" && n !== "title" && n !== "jobname") continue;
-    const v = fields[key];
-    if (typeof v === "string" && v.trim()) return v.trim();
-  }
-  return record.id;
+function driveFolderIdFromLink(link) {
+  const m = /\/folders\/([a-zA-Z0-9_-]+)/.exec(String(link || ""));
+  return m ? m[1] : null;
 }
 
 async function getModelName(record) {
@@ -161,16 +155,56 @@ async function getOrCreateFolder(name, parentId) {
   return p;
 }
 
-// Resolves (and creates if needed) the "<Model>/<Job>" Drive folder for a record.
-// Never throws — Drive is a best-effort side channel alongside Airtable uploads.
+// Counts existing "Carousel N" folders directly under a Model's Drive folder
+// and returns the next number. Stateless by design — Drive itself is the
+// source of truth, no Airtable counter field required.
+async function nextCarouselNumber(modelFolder) {
+  const drive = getDrive();
+  const res = await drive.files.list({
+    q: "'" + modelFolder + "' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+    fields: "files(id,name)",
+    pageSize: 1000,
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
+    corpora: "allDrives"
+  });
+  let max = 0;
+  for (const f of res.data.files || []) {
+    const m = /^Carousel (\d+)$/.exec(f.name || "");
+    if (m) max = Math.max(max, Number(m[1]));
+  }
+  return max + 1;
+}
+
+// Resolves the "<Model>/Carousel N" Drive folder for a record. If this record
+// was already assigned one (its Drive Folder link is already set — e.g. a
+// Style run following an earlier Generate run), reuses that same folder
+// instead of allocating a new number. Never throws — Drive is a best-effort
+// side channel alongside Airtable uploads.
 async function resolveDriveFolder(record) {
   if (!DRIVE_ENABLED) return null;
   try {
+    const existingId = driveFolderIdFromLink(record.get(DRIVE_LINK_FIELD));
+    if (existingId) return existingId;
+
     const modelName = await getModelName(record);
     const modelFolder = await getOrCreateFolder(safeFolderName(modelName || "Unassigned"), DRIVE_ROOT_FOLDER_ID);
-    return await getOrCreateFolder(safeFolderName(jobLabel(record)), modelFolder);
+    const n = await nextCarouselNumber(modelFolder);
+    return await getOrCreateFolder("Carousel " + n, modelFolder);
   } catch (e) {
     log("drive folder fail", e.message);
+    return null;
+  }
+}
+
+// Resolves the "Style N" subfolder inside a Carousel folder (N matches the
+// Output field number: 1 = raw, 2-5 = the styled looks).
+async function resolveStyleFolder(carouselFolder, n) {
+  if (!carouselFolder) return null;
+  try {
+    return await getOrCreateFolder("Style " + n, carouselFolder);
+  } catch (e) {
+    log("drive style folder fail", n, e.message);
     return null;
   }
 }
@@ -189,11 +223,6 @@ async function uploadToDrive(folderId, filename, buffer, mimeType) {
   } catch (e) {
     log("  drive upload skip", filename, e.message);
   }
-}
-
-function driveFolderIdFromLink(link) {
-  const m = /\/folders\/([a-zA-Z0-9_-]+)/.exec(String(link || ""));
-  return m ? m[1] : null;
 }
 
 async function listDriveFiles(folderId) {
@@ -223,9 +252,27 @@ async function trashDriveFile(fileId) {
   await drive.files.update({ fileId, requestBody: { trashed: true }, supportsAllDrives: true });
 }
 
-// Periodic sweep: for every record with a Drive Folder link, removes any Drive
-// file whose matching Airtable attachment (by filename) is gone — i.e. the
-// user deleted an Output image in Airtable, so its Drive copy gets cleaned up.
+// Finds the existing "Style N" subfolder inside a Carousel folder, without
+// creating one — a missing subfolder just means nothing to sync for that N.
+async function findStyleFolder(carouselFolder, n) {
+  const drive = getDrive();
+  const res = await drive.files.list({
+    q: "name='Style " + n + "' and '" + carouselFolder + "' in parents" +
+      " and mimeType='application/vnd.google-apps.folder' and trashed=false",
+    fields: "files(id,name)",
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
+    corpora: "allDrives"
+  });
+  const f = res.data.files && res.data.files[0];
+  return f ? f.id : null;
+}
+
+// Periodic sweep: for every record with a Drive Folder link, walks each
+// Style N subfolder and removes any Drive file whose matching Airtable
+// attachment (by filename, within that same Output N field) is gone — i.e.
+// the user deleted an Output image in Airtable, so its Drive copy gets
+// cleaned up too.
 async function syncDriveDeletions() {
   if (!DRIVE_ENABLED) return;
   try {
@@ -236,31 +283,40 @@ async function syncDriveDeletions() {
     }).firstPage();
 
     for (const rec of records) {
-      const folderId = driveFolderIdFromLink(rec.get(DRIVE_LINK_FIELD));
-      if (!folderId) continue;
+      const carouselFolder = driveFolderIdFromLink(rec.get(DRIVE_LINK_FIELD));
+      if (!carouselFolder) continue;
 
-      const keep = new Set();
       for (const n of [1, 2, 3, 4, 5]) {
+        const keep = new Set();
         for (const att of atts(rec, "Output " + n)) {
           if (att.filename) keep.add(att.filename);
         }
-      }
 
-      let driveFiles;
-      try {
-        driveFiles = await listDriveFiles(folderId);
-      } catch (e) {
-        log("sync list fail", rec.id, e.message);
-        continue;
-      }
-
-      for (const f of driveFiles) {
-        if (keep.has(f.name)) continue;
+        let styleFolder;
         try {
-          await trashDriveFile(f.id);
-          log("sync trashed", rec.id, f.name);
+          styleFolder = await findStyleFolder(carouselFolder, n);
         } catch (e) {
-          log("sync trash fail", rec.id, f.name, e.message);
+          log("sync find style fail", rec.id, n, e.message);
+          continue;
+        }
+        if (!styleFolder) continue;
+
+        let driveFiles;
+        try {
+          driveFiles = await listDriveFiles(styleFolder);
+        } catch (e) {
+          log("sync list fail", rec.id, n, e.message);
+          continue;
+        }
+
+        for (const f of driveFiles) {
+          if (keep.has(f.name)) continue;
+          try {
+            await trashDriveFile(f.id);
+            log("sync trashed", rec.id, "Style " + n, f.name);
+          } catch (e) {
+            log("sync trash fail", rec.id, "Style " + n, f.name, e.message);
+          }
         }
       }
     }
@@ -400,13 +456,14 @@ async function fillStyledOutputs(id, buffers, driveFolder) {
     const field = "Output " + n;
     log("look", field, look.name);
     await patch(id, { [field]: [] });
+    const styleFolder = await resolveStyleFolder(driveFolder, n);
     for (let i = 0; i < buffers.length; i++) {
       try {
         const out = await applyLook(buffers[i], look);
         const filename = "output_" + n + "_" + look.name + "_" + (i + 1) + ".jpg";
         await Promise.all([
           upload(id, field, out.toString("base64"), filename, "image/jpeg"),
-          uploadToDrive(driveFolder, filename, out, "image/jpeg")
+          uploadToDrive(styleFolder, filename, out, "image/jpeg")
         ]);
         saved += 1;
       } catch (e) {
@@ -432,6 +489,7 @@ async function runAi(record, noteT, driveFolder) {
   const queue = inputs.length ? inputs : [null];
   const buffers = [];
   let lastErr = null;
+  const styleFolder = await resolveStyleFolder(driveFolder, 1);
 
   for (let i = 0; i < queue.length; i++) {
     log("AI", i + 1, "/", queue.length);
@@ -442,7 +500,7 @@ async function runAi(record, noteT, driveFolder) {
       const buf = Buffer.from(img.data, "base64");
       await Promise.all([
         upload(id, "Output 1", img.data, filename, img.mime),
-        uploadToDrive(driveFolder, filename, buf, img.mime)
+        uploadToDrive(styleFolder, filename, buf, img.mime)
       ]);
       buffers.push(buf);
     } catch (e) {

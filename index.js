@@ -657,7 +657,10 @@ async function handleReroll(record) {
   const created = await jobs.create({
     Model: record.get("Model") || [],
     Prompt: record.get("Prompt") || "",
-    "Input References": record.get("Input References") || [],
+    // Airtable's create API only accepts {url, filename} for attachments —
+    // record.get() returns the full object (id, size, thumbnails, etc.),
+    // which it rejects wholesale as "Invalid attachment object".
+    "Input References": (record.get("Input References") || []).map((a) => ({ url: a.url, filename: a.filename })),
     Status: "Generate"
   }, { typecast: true });
   log("REROLL", id, "->", created.id);

@@ -3,7 +3,8 @@
   "version": "2.1.0",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "distribute": "node distribute.js"
   },
   "dependencies": {
     "airtable": "^0.12.2",

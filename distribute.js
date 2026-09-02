@@ -46,6 +46,7 @@ const http = require("http");
 const IG_MASTER_API_KEY = process.env.IG_MASTER_API_KEY;
 const IG_MASTER_BASE_ID = process.env.IG_MASTER_BASE_ID;
 const IG_ACCOUNTS_TABLE = process.env.IG_ACCOUNTS_TABLE || "IG Accounts";
+const IG_MASTER_MODELS_TABLE = process.env.IG_MASTER_MODELS_TABLE || "Models";
 const READY_TO_POST_TABLE = process.env.READY_TO_POST_TABLE || "Ready to Post";
 const CAROUSEL_DIST_TABLE = process.env.CAROUSEL_DIST_TABLE || "Carousel Distribution";
 const POLL_MS = Number(process.env.DISTRIBUTE_POLL_MS || 60000);
@@ -64,12 +65,56 @@ const RESTRICTION_KEYWORDS = ["banned", "disabled", "action blocked", "restricte
 
 const root = new Airtable({ apiKey: IG_MASTER_API_KEY }).base(IG_MASTER_BASE_ID);
 const accountsTable = root(IG_ACCOUNTS_TABLE);
+const modelsTable = root(IG_MASTER_MODELS_TABLE);
 const distTable = root(CAROUSEL_DIST_TABLE);
 const readyTable = root(READY_TO_POST_TABLE);
 
 let busy = false;
 
+// Reports, per Model, how many eligible accounts exist vs. how many have
+// never received any carousel content at all (batchKeys empty) — the
+// accounts most in need of fresh content for that Model.
+async function buildNeedReport() {
+  const [accounts, usage, modelRecords] = await Promise.all([
+    loadEligibleAccounts(),
+    buildUsage(),
+    modelsTable.select({ maxRecords: 5000, fields: ["Name"] }).all()
+  ]);
+
+  const modelNames = new Map(modelRecords.map((m) => [m.id, m.get("Name") || m.id]));
+  const byModel = new Map(); // modelId -> { model, total, needCarousel }
+
+  for (const a of accounts) {
+    const modelId = (a.get("Model") || [])[0];
+    if (!modelId) continue;
+    if (!byModel.has(modelId)) {
+      byModel.set(modelId, { model: modelNames.get(modelId) || modelId, total: 0, needCarousel: 0 });
+    }
+    const m = byModel.get(modelId);
+    m.total += 1;
+    const u = usage.get(a.id);
+    if (!u || u.batchKeys.size === 0) m.needCarousel += 1;
+  }
+
+  return {
+    totalEligibleAccounts: accounts.length,
+    byModel: [...byModel.values()].sort((x, y) => y.needCarousel - x.needCarousel)
+  };
+}
+
 http.createServer((req, res) => {
+  if (req.url === "/status") {
+    buildNeedReport()
+      .then((report) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(report, null, 2));
+      })
+      .catch((e) => {
+        res.writeHead(500, { "Content-Type": "text/plain" });
+        res.end("error: " + e.message);
+      });
+    return;
+  }
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("ok\n");
 }).listen(PORT, () => console.log("http", PORT));

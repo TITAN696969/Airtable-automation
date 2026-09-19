@@ -134,13 +134,23 @@ async function styleFolderHasFiles(folderId) {
 
 const modelCache = new Map(); // model name -> IG Master Models record id (or null)
 
-async function findIgMasterModelId(name) {
+async function findIgMasterModelId(rawName) {
+  const name = String(rawName).trim();
   if (modelCache.has(name)) return modelCache.get(name);
-  const safe = String(name).replace(/'/g, "\\'");
+  const safe = name.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  // Case/whitespace-insensitive so minor formatting differences between the
+  // two bases (trailing space, capitalization) still match the right model.
   const found = await igModels.select({
-    filterByFormula: "{Name}='" + safe + "'",
-    maxRecords: 1
+    filterByFormula: "LOWER(TRIM({Name}))=LOWER('" + safe + "')",
+    maxRecords: 5
   }).firstPage();
+  if (found.length > 1) {
+    throw new Error(
+      'multiple Models named "' + name + '" in IG Master (' +
+      found.map((r) => r.id).join(", ") +
+      ") - fix the duplicate before promoting, refusing to guess which one gets the content"
+    );
+  }
   const id = found.length ? found[0].id : null;
   modelCache.set(name, id);
   return id;

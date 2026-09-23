@@ -61,6 +61,26 @@ Run: `npm run distribute`. `GET /status` on its HTTP port reports, per
 Model, how many eligible accounts exist vs. how many have never received
 any carousel content yet.
 
+### 4. `cleanup.js` — row cleanup worker
+General-purpose, standalone deletion worker for any Airtable table that
+grows without bound once its rows are "done" (e.g. the Clip Farm base's
+per-clip table). Not wired to any other script here — point it at whatever
+base/table/status-field/value combination applies via `CLEANUP_*` env vars.
+
+- Every `CLEANUP_POLL_MS` (default 30 min), finds every row where
+  `{CLEANUP_STATUS_FIELD}` equals `CLEANUP_POSTED_VALUE` (defaults to
+  `Status` / `Posted`) and deletes them, 10 at a time (Airtable's batch
+  delete limit).
+- **Defaults to dry-run** (`CLEANUP_DRY_RUN=true`): logs which record IDs
+  it would delete (plus `CLEANUP_PREVIEW_FIELD`, if set, so the log line is
+  actually checkable against the base) without deleting anything. Only set
+  `CLEANUP_DRY_RUN=false` after confirming a dry run matched the right rows
+  — deletion via the Airtable API is permanent, there's no undo.
+- `GET /status` reports the dry-run flag and the last run's matched/deleted
+  counts. `GET /run-now` triggers an out-of-cycle run.
+
+Run: `npm run cleanup`
+
 ## Tracking a weekly batch → model → account
 
 This is the built-in answer to "which account did this week's batch go

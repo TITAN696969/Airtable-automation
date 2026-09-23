@@ -61,21 +61,35 @@ Run: `npm run distribute`. `GET /status` on its HTTP port reports, per
 Model, how many eligible accounts exist vs. how many have never received
 any carousel content yet.
 
-### 4. `cleanup.js` — row cleanup worker
-General-purpose, standalone deletion worker for any Airtable table that
-grows without bound once its rows are "done" (e.g. the Clip Farm base's
-per-clip table). Not wired to any other script here — point it at whatever
-base/table/status-field/value combination applies via `CLEANUP_*` env vars.
+### 4. `cleanup.js` — source-row cleanup worker
+Deletes rows from a content-source base/table (e.g. Clip Farm's own `Clip
+Farm` table) once every row that references them in IG Master's `Ready to
+Post` table is done — so source tables that keep growing after their
+content has already gone out don't balloon forever.
 
-- Every `CLEANUP_POLL_MS` (default 30 min), finds every row where
-  `{CLEANUP_STATUS_FIELD}` equals `CLEANUP_POSTED_VALUE` (defaults to
-  `Status` / `Posted`) and deletes them, 10 at a time (Airtable's batch
-  delete limit).
+This is a cross-base join, not a simple status check, because:
+- One source row can produce several sibling copies (one per IG account),
+  and each copy produces several posting rows (variants) in `Ready to
+  Post` — so there's no clean 1:1 or Batch-Key-based relationship, and
+  older rows may not even have a Batch Key.
+- The only reliable link is a per-pipeline field on the `Ready to Post`
+  row (e.g. `Clip Farm Row ID`, `Kling Row ID`, `Transition Row ID`) that
+  stores the source row's own Airtable record id.
+
+So for every source row, this script looks up every `Ready to Post` row
+whose `CLEANUP_LINK_FIELD` equals that source row's id, and only deletes
+it once **all** of those linked rows have a `Status` in
+`CLEANUP_DONE_STATUSES` (default `Posted,Churned`). A source row with zero
+linked rows yet (not distributed/tracked) is left alone. Deploy one
+instance per pipeline — `CLEANUP_LINK_FIELD` and `CLEANUP_SOURCE_*` vary
+per pipeline, everything else is shared.
+
 - **Defaults to dry-run** (`CLEANUP_DRY_RUN=true`): logs which record IDs
-  it would delete (plus `CLEANUP_PREVIEW_FIELD`, if set, so the log line is
-  actually checkable against the base) without deleting anything. Only set
-  `CLEANUP_DRY_RUN=false` after confirming a dry run matched the right rows
-  — deletion via the Airtable API is permanent, there's no undo.
+  it would delete (plus `CLEANUP_PREVIEW_FIELD`, if set) without deleting
+  anything. Only set `CLEANUP_DRY_RUN=false` after confirming a dry run
+  matched the right rows — deletion via the Airtable API is permanent.
+- `CLEANUP_MAX_DELETES_PER_RUN` (default 100) caps how many rows one run
+  can delete, so a misconfiguration can't wipe an entire table in one shot.
 - `GET /status` reports the dry-run flag and the last run's matched/deleted
   counts. `GET /run-now` triggers an out-of-cycle run.
 

@@ -5,8 +5,7 @@
   "scripts": {
     "start": "node index.js",
     "distribute": "node distribute.js",
-    "promote": "node promote.js",
-    "cleanup": "node cleanup.js"
+    "promote": "node promote.js"
   },
   "dependencies": {
     "airtable": "^0.12.2",

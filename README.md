@@ -61,40 +61,6 @@ Run: `npm run distribute`. `GET /status` on its HTTP port reports, per
 Model, how many eligible accounts exist vs. how many have never received
 any carousel content yet.
 
-### 4. `cleanup.js` — source-row cleanup worker
-Deletes rows from a content-source base/table (e.g. Clip Farm's own `Clip
-Farm` table) once every row that references them in IG Master's `Ready to
-Post` table is done — so source tables that keep growing after their
-content has already gone out don't balloon forever.
-
-This is a cross-base join, not a simple status check, because:
-- One source row can produce several sibling copies (one per IG account),
-  and each copy produces several posting rows (variants) in `Ready to
-  Post` — so there's no clean 1:1 or Batch-Key-based relationship, and
-  older rows may not even have a Batch Key.
-- The only reliable link is a per-pipeline field on the `Ready to Post`
-  row (e.g. `Clip Farm Row ID`, `Kling Row ID`, `Transition Row ID`) that
-  stores the source row's own Airtable record id.
-
-So for every source row, this script looks up every `Ready to Post` row
-whose `CLEANUP_LINK_FIELD` equals that source row's id, and only deletes
-it once **all** of those linked rows have a `Status` in
-`CLEANUP_DONE_STATUSES` (default `Posted,Churned`). A source row with zero
-linked rows yet (not distributed/tracked) is left alone. Deploy one
-instance per pipeline — `CLEANUP_LINK_FIELD` and `CLEANUP_SOURCE_*` vary
-per pipeline, everything else is shared.
-
-- **Defaults to dry-run** (`CLEANUP_DRY_RUN=true`): logs which record IDs
-  it would delete (plus `CLEANUP_PREVIEW_FIELD`, if set) without deleting
-  anything. Only set `CLEANUP_DRY_RUN=false` after confirming a dry run
-  matched the right rows — deletion via the Airtable API is permanent.
-- `CLEANUP_MAX_DELETES_PER_RUN` (default 100) caps how many rows one run
-  can delete, so a misconfiguration can't wipe an entire table in one shot.
-- `GET /status` reports the dry-run flag and the last run's matched/deleted
-  counts. `GET /run-now` triggers an out-of-cycle run.
-
-Run: `npm run cleanup`
-
 ## Tracking a weekly batch → model → account
 
 This is the built-in answer to "which account did this week's batch go

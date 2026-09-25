@@ -105,6 +105,9 @@ async function buildNeedReport() {
 
   for (const m of byModel.values()) {
     m.carouselsNeeded = Math.ceil(m.needCarousel / STYLES_PER_CAROUSEL);
+    m.note = m.carouselsNeeded === 0
+      ? "Already covers all accounts"
+      : `Needs ${m.carouselsNeeded} more carousel${m.carouselsNeeded === 1 ? "" : "s"} to fill all accounts`;
   }
 
   return {

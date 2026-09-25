@@ -71,9 +71,16 @@ const readyTable = root(READY_TO_POST_TABLE);
 
 let busy = false;
 
+// Styles produced per carousel job (promote.js creates one Distribution row
+// per Style 1-5 folder). A reroll shares its original's Batch Key (see
+// promote.js baseCarouselName), so it never adds capacity for more accounts —
+// only a brand-new carousel job does. This is what carouselsNeeded counts.
+const STYLES_PER_CAROUSEL = Number(process.env.STYLES_PER_CAROUSEL || 5);
+
 // Reports, per Model, how many eligible accounts exist vs. how many have
 // never received any carousel content at all (batchKeys empty) — the
-// accounts most in need of fresh content for that Model.
+// accounts most in need of fresh content for that Model — plus how many new
+// carousel jobs (not rerolls) would be needed to cover all of them.
 async function buildNeedReport() {
   const [accounts, usage, modelRecords] = await Promise.all([
     loadEligibleAccounts(),
@@ -96,8 +103,16 @@ async function buildNeedReport() {
     if (!u || u.batchKeys.size === 0) m.needCarousel += 1;
   }
 
+  for (const m of byModel.values()) {
+    m.carouselsNeeded = Math.ceil(m.needCarousel / STYLES_PER_CAROUSEL);
+    m.note = m.carouselsNeeded === 0
+      ? "Already covers all accounts"
+      : `Needs ${m.carouselsNeeded} more carousel${m.carouselsNeeded === 1 ? "" : "s"} to fill all accounts`;
+  }
+
   return {
     totalEligibleAccounts: accounts.length,
+    stylesPerCarousel: STYLES_PER_CAROUSEL,
     byModel: [...byModel.values()].sort((x, y) => y.needCarousel - x.needCarousel)
   };
 }

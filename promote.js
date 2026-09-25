@@ -15,11 +15,17 @@
 //   Promoted (checkbox) — written by this script once a carousel has been
 //     turned into Distribution rows, so it's never promoted twice. Don't
 //     check this yourself.
+//   Rerolls Suggested (number) — written by this script every time it
+//     promotes a carousel: how many more times to hit Reroll on this record
+//     so its Batch Key has enough Style-folder rows to cover every eligible
+//     IG account for its Model. 0 means it already covers everyone. Don't
+//     set this yourself — it gets overwritten on the next promote.
 //
 // Reuses the same AIRTABLE_* and GOOGLE_*/DRIVE_* env vars as index.js (point
 // this at the same env group and it just works), plus the same IG_MASTER_*
-// env vars as distribute.js, plus IG_MASTER_MODELS_TABLE to resolve a model
-// name into that base's own Models record for linking.
+// env vars as distribute.js (including IG_ACCOUNTS_TABLE), plus
+// IG_MASTER_MODELS_TABLE to resolve a model name into that base's own Models
+// record for linking.
 
 const Airtable = require("airtable");
 const http = require("http");
@@ -37,6 +43,15 @@ const IG_MASTER_API_KEY = process.env.IG_MASTER_API_KEY;
 const IG_MASTER_BASE_ID = process.env.IG_MASTER_BASE_ID;
 const IG_MASTER_MODELS_TABLE = process.env.IG_MASTER_MODELS_TABLE || "Models";
 const CAROUSEL_DIST_TABLE = process.env.CAROUSEL_DIST_TABLE || "Carousel Distribution";
+const IG_ACCOUNTS_TABLE = process.env.IG_ACCOUNTS_TABLE || "IG Accounts";
+const REROLLS_FIELD = process.env.REROLLS_FIELD || "Rerolls Suggested";
+
+// Styles produced per carousel job/reroll (kept in sync with distribute.js's
+// STYLES_PER_CAROUSEL — a reroll shares its original's Batch Key, so its 5
+// new style folders add 5 more slots eligible accounts can be assigned from).
+const STYLES_PER_CAROUSEL = Number(process.env.STYLES_PER_CAROUSEL || 5);
+
+const RESTRICTION_KEYWORDS = ["banned", "disabled", "action blocked", "restricted"];
 
 const DRIVE_AUTH_MODE = process.env.GOOGLE_SERVICE_ACCOUNT_JSON
   ? "service_account"
@@ -51,6 +66,7 @@ const jobs = new Airtable({ apiKey: AIRTABLE_API_KEY }).base(BASE_ID)(TABLE_ID);
 const models = new Airtable({ apiKey: AIRTABLE_API_KEY }).base(BASE_ID)(MODELS_TABLE);
 const igModels = new Airtable({ apiKey: IG_MASTER_API_KEY }).base(IG_MASTER_BASE_ID)(IG_MASTER_MODELS_TABLE);
 const distTable = new Airtable({ apiKey: IG_MASTER_API_KEY }).base(IG_MASTER_BASE_ID)(CAROUSEL_DIST_TABLE);
+const igAccounts = new Airtable({ apiKey: IG_MASTER_API_KEY }).base(IG_MASTER_BASE_ID)(IG_ACCOUNTS_TABLE);
 
 let busy = false;
 
@@ -151,7 +167,36 @@ function baseCarouselName(folderName) {
   return folderName.replace(/_\d+$/, "");
 }
 
-async function promoteOne(record) {
+function isRestricted(account) {
+  const s = String(account.get("Restriction Status") || "").toLowerCase();
+  return RESTRICTION_KEYWORDS.some((kw) => s.includes(kw));
+}
+
+// Mirrors distribute.js's loadEligibleAccounts — same Warming/Active +
+// not-restricted rule — so the reroll suggestion matches what distribute.js
+// will actually be able to assign.
+async function loadEligibleAccounts() {
+  const records = await igAccounts.select({
+    filterByFormula: 'OR({Status}="Warming",{Status}="Active")',
+    maxRecords: 5000
+  }).all();
+  return records.filter((a) => {
+    const model = a.get("Model");
+    return Array.isArray(model) && model.length && !isRestricted(a);
+  });
+}
+
+async function countExistingSlots(batchKey) {
+  const safe = String(batchKey).replace(/'/g, "\\'");
+  const rows = await distTable.select({
+    filterByFormula: "{Batch Key}='" + safe + "'",
+    maxRecords: 5000,
+    fields: ["Batch Key"]
+  }).all();
+  return rows.length;
+}
+
+async function promoteOne(record, eligibleAccounts) {
   const id = record.id;
   const driveLink = record.get(DRIVE_LINK_FIELD);
   const carouselFolderId = driveFolderIdFromLink(driveLink);
@@ -186,8 +231,15 @@ async function promoteOne(record) {
 
   if (!created) throw new Error("no Style folders with files found under " + driveLink);
 
-  await withRetry(() => jobs.update(id, { [PROMOTED_FIELD]: true }, { typecast: true }), { label: "mark promoted " + id });
-  log("PROMOTED", id, batchKey, created, "rows");
+  const eligibleForModel = eligibleAccounts.filter((a) => (a.get("Model") || [])[0] === igModelId).length;
+  const existingSlots = await countExistingSlots(batchKey);
+  const rerollsSuggested = Math.max(0, Math.ceil((eligibleForModel - existingSlots) / STYLES_PER_CAROUSEL));
+
+  await withRetry(() => jobs.update(id, {
+    [PROMOTED_FIELD]: true,
+    [REROLLS_FIELD]: rerollsSuggested
+  }, { typecast: true }), { label: "mark promoted " + id });
+  log("PROMOTED", id, batchKey, created, "rows", "rerollsSuggested", rerollsSuggested);
 }
 
 async function poll() {
@@ -204,9 +256,10 @@ async function poll() {
       return;
     }
 
+    const eligibleAccounts = await loadEligibleAccounts();
     for (const record of found) {
       try {
-        await promoteOne(record);
+        await promoteOne(record, eligibleAccounts);
       } catch (e) {
         log("FAIL promote", record.id, e.message);
       }
